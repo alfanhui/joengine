@@ -1,6 +1,6 @@
 /*
 ** Jo Sega Saturn Engine
-** Copyright (c) 2012-2017, Johannes Fetz (johannesfetz@gmail.com)
+** Copyright (c) 2012-2026, Johannes Fetz (johannesfetz@gmail.com)
 ** All rights reserved.
 **
 ** Redistribution and use in source and binary forms, with or without
@@ -26,6 +26,8 @@
 ** SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <jo/jo.h>
+#define LWRAM_HEAP_SIZE 0x40000 // Number of bytes to extend the heap
+#define LWRAM 0x00200000
 
 void			    my_draw(void)
 {
@@ -41,19 +43,23 @@ void                my_video_stopped(void)
 }
 
 /*
-** HOW TO CREATE CPK FILE (Work In Progress)
+** HOW TO CREATE CPK FILE
 **
 ** 1) Install ffmpeg: https://www.ffmpeg.org
 ** 2) Use the following command line:
-**    ffmpeg -i SOURCE.AVI -c:a libavformat -f film_cpk -s 320x224 -pix_fmt rgb24 SAMPLE.CPK
+**    ffmpeg -i SOURCE.AVI -c:v cinepak -pix_fmt rgb24 -s 320x224 -r 15 -c:a pcm_s16be_planar -ac 1 -ar 22050 -f film_cpk SAMPLE.CPK
 **
-** Note: The video glitch on SSF and crash Yabause.
-**       There must still be values ​​to set on ffmpeg to show the video properly (like tbn and tbc).
+**    -c:v cinepak             : Cinepak video (the only video codec supported)
+**    -s 320x224 -r 15         : Video size and frame rate (smaller and slower videos are easier to stream from the CD)
+**    -c:a pcm_s16be_planar    : Raw 16 bits PCM audio (use -c:a pcm_s8_planar for 8 bits audio)
+**    -ac 1 -ar 22050          : Mono (or -ac 2 for stereo), 22050 Hz
+**    -an                      : Add this option instead of the audio options for a video without sound
 */
 
 void			    jo_main(void)
 {
 	jo_core_init(JO_COLOR_Black);
+    jo_add_memory_zone((unsigned char *)LWRAM, LWRAM_HEAP_SIZE);
 	if (jo_video_open_file("SAMPLE.CPK"))
         jo_video_play(my_video_stopped);
 	jo_core_add_callback(my_draw);

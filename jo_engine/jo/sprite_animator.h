@@ -1,6 +1,6 @@
 /*
 ** Jo Sega Saturn Engine
-** Copyright (c) 2012-2024, Johannes Fetz (johannesfetz@gmail.com)
+** Copyright (c) 2012-2026, Johannes Fetz (johannesfetz@gmail.com)
 ** All rights reserved.
 **
 ** Redistribution and use in source and binary forms, with or without
@@ -189,6 +189,11 @@ int			jo_replace_sprite_anim(const int at, const unsigned short sprite_id, const
  *  @return -1 if failed or Animation Id (ANIM_ID)
  */
 int			jo_create_sprite_anim(const unsigned short sprite_id, const unsigned short frame_count, const unsigned char frame_rate);
+
+/** @brief Remove a specific animation by ID
+ *  @param anim_id Id returned by jo_create_sprite_anim()
+ */
+void        jo_remove_sprite_anim(const int anim_id);
 
 /** @brief Clear all sprite animation
  */
