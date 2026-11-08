@@ -107,6 +107,43 @@ CLAUDE.md sit in the jo-engine checkout around it.
 
 ## Saturn / SGL / jo facts that cost time
 
+- **jo-engine 2026 has no SGL** (circuit-breaker moved on 2026-11-08, branch
+  `feature/jo-engine-2026`). Notes below that name SGL are history unless they say otherwise.
+  What took finding out:
+  - SGL's types are jo's under new names, same memory layout: POINT -> `jo_pos3D_fixed` (`.x`,
+    not `[X]`), POLYGON -> `jo_3d_polygon` (`.normal`, `.vertices`), ATTR ->
+    `jo_3d_polygon_attribute` (flag/texno/atrb/colno/gstb/dir -> plane/texture_id/draw_mode/
+    color/gouraud_table/direction), PDATA's pntbl/nbPoint/pltbl/nbPolygon/attbl ->
+    points/point_count/polygons/polygon_count/attributes. Sort codes keep their values
+    (SORT_BFR 0 = `JO_3D_SORT_PREVIOUS`, MIN 1, MAX 2, CEN 3 = `JO_3D_SORT_CENTER`);
+    sprPolygon/sprLine -> `JO_VDP1_POLYGON`/`JO_VDP1_LINE`; CL_Gouraud ->
+    `JO_VDP1_COLOR_CALC_GOURAUD`. The rename was a script (no layout change, so no surprises).
+  - slSin/slCos -> `jo_sin_angle`/`jo_cos_angle` (same jo_angle, 4096-step table). There's no
+    tan of a jo_angle (`jo_tan` takes whole degrees): `src/utils/angles.h` `angle_tan` =
+    sin/cos with `jo_fixed_div`, the SH-2's divider. slRotX/slScale/slPerspective by an angle:
+    jo's `__jo_3d_rotate`/`__jo_3d_scale`/`__jo_3d_set_perspective` ("internal", still public in
+    v2026.2), wrapped in that same header. slConvert3Dto2D -> `jo_3d_transform_point` then
+    x * `jo_3d_get_projection_distance()` / z. slZdspLevel -> `jo_3d_display_level`.
+  - **jo uses SCU DMA level 0 every frame** (the VDP1 command table): the floor fog moved to
+    level 1. Levels 1 and 2 are free (CD reads use the SH-2's own DMA).
+  - jo writes VDP2 registers from a shadow copy in VBlank, only the ones it changed. It has no
+    calls for the line colour screen: LCTA and LNCLEN are written directly; CCCTL through
+    `jo_enable_screen_transparency(JO_RBG0_SCREEN, 0)`. jo's coefficient table no longer carries
+    line colours (no K_LINECOL to undo).
+  - VDP1 RAM: textures from 0x10000 (was 0xE1C0), up to 0x7E6F8; jo's 3D Gouraud tables at
+    0x7E700 and 0x7FF00. Ours at 0x70000-0x75808 still fit. Command tables at 0x20 and 0x8000,
+    turn about: LOPR reads 0x1000 more in the second (`perf.c` masks it).
+  - `JO_FRAMERATE = 1` now swaps VDP1's buffers every VBlank, finished or not: a frame VDP1
+    can't finish loses its last commands (the HUD). `JO_FRAMERATE_DYNAMIC = 1` swaps only once
+    drawn, as SGL did; the game steps by `perf_last_frame_vblanks`.
+  - `start.S` clears all of BSS: jo's old quarter-clear bug (byte count from int pointers) is gone.
+  - jo gives jo_malloc all free high Work RAM itself; SGL's 0x060C0000 limit is gone. Low Work
+    RAM is still unused by jo (main.c adds it).
+  - **CPU cost went up ~25 points on foot** (yard: cpu 66-81% under SGL, 91-107% now, the same
+    132 polygons). SGL shared polygon work with the slave SH-2; jo does it on the master unless
+    asked, and cuts polygons that cross the screen edge or near plane in C (its slow path).
+    `jo_3d_enable_dsp(false)` changed nothing measurable. See BACKLOG.
+
 - VDP1 maps a texture onto a 4-corner quad linearly, not in perspective: a circle texture on a
   trapezoid comes out a dome (the user: "a bent bicycle tyre"). For perspective, cut it into
   bands, each on its own projected quad. Each jo sprite call costs ~700 SH-2 cycles (~0.15% of a
@@ -160,7 +197,9 @@ CLAUDE.md sit in the jo-engine checkout around it.
   when the build line has no `game.iso found`.
 - Judge "it looks the same without X" side by side, at full size: the arena's walls looked
   absent from the doorway view, but its top rises above the corridor's walls (dark on dark).
-- The `cpu` figure stops at `draw_3d`'s end: SGL's own work after it (slSynch) isn't in it. A
+- The `cpu` figure stops at `draw_3d`'s end: jo's own work after it (sorting and sending the
+  commands; SGL's slSynch before 2026-11-08) isn't in it. jo 2026 transforms and cuts each mesh
+  during `jo_3d_mesh_draw`, so that is in it. A
   frame at ~85% average / ~100% peak already misses the vblank; aim for ~75%.
 - The debug line's part figures (`ar co sd tp fl ...`) can read more than the `cpu` peak (`fl126`
   with `pk 107`; a temporary check showed the FRC isn't reset mid-frame, cause not found). Read
@@ -192,8 +231,8 @@ CLAUDE.md sit in the jo-engine checkout around it.
 - Disc file names are 8.3 (`WALL_BASE.TGA` failed; `WALLBASE.TGA` works).
 - SGL stops drawing polygons a little under 8192 units deep. The world is handed to SGL at
   1/4 scale (`VIEW_WORLD_SCALE`), and `slZdspLevel(7)` keeps near pieces from being dropped.
-- jo's `JO_VDP2_LINE_COLOR_TABLE` sits at the start of VRAM B1, on SGL's text font: allocate the
-  line colour table in A0 instead. jo's K table has `K_LINECOL`; re-register it without it.
+- (SGL) jo's `JO_VDP2_LINE_COLOR_TABLE` sat at the start of VRAM B1, on SGL's text font: the
+  line colour table is allocated with the floor's cells (`JO_VDP2_RAM_CELL_RBG0`) instead.
 - VDP2 line colour in additive mode can only brighten: it can fog to a glow, never to black.
   Ratio mode (`CC_RATE`) with a black line colour does fog to black; ratio 31 = black, 0 = floor.
   The ratio is one register (CCRR, 0x25F8010C) for the whole screen.
@@ -205,7 +244,7 @@ CLAUDE.md sit in the jo-engine checkout around it.
   0x70000 (gstb 0xE000); jo's sprite shading uses the first ones. Each channel adds
   (value - 16): 16 = no change, so it can only dim by 16 of 31 steps, never to black.
   VDP1 draws a frame behind the CPU: per-frame tables need two sets, alternating.
-  jo's textures may grow up to 0x7FEF8, through the table area: check `jo_sprite_usage_percent`.
+  jo's textures may grow up to 0x7E6F8 (jo 2026), through the table area: check `jo_sprite_usage_percent`.
 - SGL reads a mesh's attributes during `jo_3d_mesh_draw` (slPutPolygon): shared ATTR arrays
   can be changed between draws in a frame (the iso cutaway and the wall fog rely on it).
 - SGL drops polygons and sprites nearer than its screen distance / 2^slZdspLevel (level 7:
@@ -213,7 +252,7 @@ CLAUDE.md sit in the jo-engine checkout around it.
   (60). A HUD sprite at depth 2 vanished in iso; 4 works (the world's nearest is 5).
 - `DEGtoANG()` is a float macro: fine with constants, but with a variable it's software float
   at runtime. Degrees to ANGLE: x 182 (65536 / 360 = 182.04). jo's headers don't declare
-  slSin/slCos/slTan (implicit declarations); declare `extern FIXED slTan(ANGLE);` where used.
+  slSin/slCos/slTan (gone with SGL: `src/utils/angles.h`).
 - Screen-space rectangles (HUD): `jo_sprite_draw_4p_fixed(sprite, corners, depth, true)`
   takes pixels from the screen centre, no perspective. A solid 8x8 texture from
   `jo_sprite_add` stretches to any size (`src/hud.c`).
@@ -578,7 +617,7 @@ Also in `Manuals/`:
 - What looked like the surround covering the far wall was the far wall's own thin texture rows
   dropping in and out (2000-long LOD pieces): compare with a build without the change before
   hunting a bug in it.
-- SGL uses all three SCU DMA levels: 2 streams PCM sound while a sample plays (`PCM_Trans`), 1
+- (SGL, before 2026-11-08; jo 2026 uses only level 0) SGL used all three SCU DMA levels: 2 streams PCM sound while a sample plays (`PCM_Trans`), 1
   its own transfers (`DMA_Trans`), 0 CD reads (GFS) and `DMA_ScuMemCopy`. The floor fog sat on
   level 2 and died at the first sound, unnoticed for days (in 1st person the fog is only ~10 rows
   under the horizon). It's on level 0 now, re-armed whole every VBlank. To find what a closed
@@ -614,7 +653,7 @@ Also in `Manuals/`:
 - **E2E shot names must sort**: the contact sheet takes them alphabetically, so `breach_8` lands
   after `breach_35`. Pad them (`seq -w`).
 
-- **High Work RAM ends at 0x060C0000 for us**: SGL's sort list and work areas start there. jo's
+- **(SGL, before 2026-11-08) High Work RAM ended at 0x060C0000 for us**: SGL's sort list and work areas started there. jo's
   malloc heap is a static array in our BSS (`JO_GLOBAL_MEMORY_SIZE_FOR_MALLOC`, jo's default 384 KB),
   so every static array we add eats into the same space. Past the line, a JO_DEBUG build doesn't
   start at all: a black screen, every E2E shot black. Check `.bss` start + size in `game.map`.
