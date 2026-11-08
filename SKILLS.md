@@ -167,12 +167,16 @@ CLAUDE.md sit in the jo-engine checkout around it.
     Now: the yard 60 fps throughout at cpu 40-72%, the doorway 60 (was 30-45), `stairs_perf`'s
     platform lip 60 (30 even under SGL). There the master waits ~9 ms for the slave: the slave
     is the busier CPU.
+  - **Pushing from this machine**: no SSH agent, so `git push` to the SSH remotes fails. `gh` is
+    signed in: push one branch over HTTPS without changing any git config with
+    `git -c credential.helper= -c credential.helper='!gh auth git-credential' push https://github.com/alfanhui/joengine.git <branch>`.
+    Upstream PRs go from a worktree on `upstream/master` (CLAUDE.md, "give back upstream").
   - **jo's profiler** (`JO_COMPILE_WITH_PROFILER_MODULE = 1`, `jo_profile_get(JO_PROFILE_3D_...)`)
     uses the same FRC as `perf.c`, which zeroes it every frame: its clip figure came out as
     garbage. Timing jo's draw calls with our own `perf_part_add` agreed with its vertex and
     polygon figures. `JO_TEST_PATH_COUNTS` (in `_CCFLAGS`, then a clean build) fills
     `__jo_3d_path_counts[8][4]`. jo's profile.c calls `jo_core_exec_on_slave` without the dual
-    CPU module (an implicit declaration warning).
+    CPU module (an implicit declaration warning): fixed upstream in PR #106.
 
 - VDP1 maps a texture onto a 4-corner quad linearly, not in perspective: a circle texture on a
   trapezoid comes out a dome (the user: "a bent bicycle tyre"). For perspective, cut it into

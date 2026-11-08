@@ -50,6 +50,26 @@ We need to unit-test where possible, as visual tests are harder to achieve. Wher
 
 It is paramount that I learn along side the development. It is no good AI changing the code if I do not understand why, how, what. Ensure code is commented, and if possible, write the code incrementally that allows me to understand - like pair programming together.
 
+## jo-engine: give back upstream
+
+CircuitBreaker is built on jo-engine, the work of Johannes Fetz. We respect it, and whatever we find
+that makes the engine objectively better goes back to it, not only into our copy:
+
+- **A bug in jo** (with a fix that's small and clear): a pull request to `johannes-fetz/joengine`.
+  Branch from `upstream/master` in a separate git worktree, so the copy the game builds against
+  isn't touched; push the branch to the fork (`alfanhui/joengine`) and open the PR from there.
+- **A gap, a cost or a design question** (anything with more than one good answer): a GitHub issue,
+  with the measurements and what we did meanwhile. Offer a PR; don't send one unasked for a design
+  the author may want otherwise.
+- **Check first:** look for an existing issue or PR; reproduce on the latest release, not our fork;
+  show before and after (a warning, a symbol, a figure). Say only what was really tested, and how.
+- **Keep it in jo's own terms:** follow its code style and commit messages ("Fix: ..."), change no
+  more than the fix needs, and write as a grateful user: thanks, facts, an offer to help.
+- **Our side:** a workaround in the game names its issue or PR (`johannes-fetz/joengine#108`), and
+  docs/BACKLOG.md tracks what's open upstream, so the workaround goes once jo has the real thing.
+- Avoid changing jo in our fork for the game's sake. If a change is needed before upstream takes
+  it, keep it the same as the PR.
+
 ## Learnings
 
 Read `SKILLS.md` (next to this file) at the start of every session: build and test commands, tool quirks, Saturn/SGL facts and mistakes already made. Add to it whenever something takes time to find out.
