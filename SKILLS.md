@@ -130,19 +130,49 @@ CLAUDE.md sit in the jo-engine checkout around it.
     calls for the line colour screen: LCTA and LNCLEN are written directly; CCCTL through
     `jo_enable_screen_transparency(JO_RBG0_SCREEN, 0)`. jo's coefficient table no longer carries
     line colours (no K_LINECOL to undo).
-  - VDP1 RAM: textures from 0x10000 (was 0xE1C0), up to 0x7E6F8; jo's 3D Gouraud tables at
-    0x7E700 and 0x7FF00. Ours at 0x70000-0x75808 still fit. Command tables at 0x20 and 0x8000,
+  - VDP1 RAM: textures from 0x10000 (was 0xE1C0), up to 0x7E4F8 (v2026.2; 0x7E6F8 in v2026.1);
+    jo's sprite shading tables from 0x7E4F8 (v2026.2: they were at 0x70000), its 3D's at 0x7E700
+    and 0x7FF00. Ours at 0x70000-0x75808 still fit. Command tables at 0x20 and 0x8000,
     turn about: LOPR reads 0x1000 more in the second (`perf.c` masks it).
   - `JO_FRAMERATE = 1` now swaps VDP1's buffers every VBlank, finished or not: a frame VDP1
     can't finish loses its last commands (the HUD). `JO_FRAMERATE_DYNAMIC = 1` swaps only once
     drawn, as SGL did; the game steps by `perf_last_frame_vblanks`.
+  - jo zeroes its polygon counts (`jo_3d_get_displayed_polygon_count` etc.) at the end of each
+    frame, after our callbacks: read them at the frame's end, not the next frame's start.
+  - v2026.2: A+B+C+Start and the CD tray opening go back to the BIOS menu by default
+    (`jo_core_set_restart_game_callback` / `jo_core_set_cd_tray_open_callback` to change it).
+    With `JO_DEBUG`, the master CPU traps reads and writes to the first 4 KB (NULL pointers):
+    a crash there is a real bug, not jo.
   - `start.S` clears all of BSS: jo's old quarter-clear bug (byte count from int pointers) is gone.
   - jo gives jo_malloc all free high Work RAM itself; SGL's 0x060C0000 limit is gone. Low Work
     RAM is still unused by jo (main.c adds it).
-  - **CPU cost went up ~25 points on foot** (yard: cpu 66-81% under SGL, 91-107% now, the same
-    132 polygons). SGL shared polygon work with the slave SH-2; jo does it on the master unless
-    asked, and cuts polygons that cross the screen edge or near plane in C (its slow path).
-    `jo_3d_enable_dsp(false)` changed nothing measurable. See BACKLOG.
+  - **The CPU cost on foot, and how it was won back** (2026-11-08). After the port the yard
+    took cpu 91-107% (52-60 fps); under SGL 66-81%. SGL had shared polygon work with the slave
+    SH-2 without being asked; jo does all of it on the master. Measured: jo's draw calls were
+    ~40% of a frame (~1000 cycles a polygon), every polygon on jo's fast assembly path (none cut,
+    none in parts: `JO_TEST_PATH_COUNTS`), the meshes in high Work RAM. The SCU DSP for vertices
+    (`jo_3d_enable_dsp`) changed nothing. What did:
+    - `JO_COMPILE_WITH_DUAL_CPU_MODULE = 1`: jo sorts and sends the VDP1 commands on the slave
+      (outside our `cpu` figure, but in the frame's time: the late frames went from ~27 to 5);
+    - `src/slave_draw.c`: the corridor's floor and boxes handed to the slave as they're built
+      (`jo_3d_slave_begin`, `jo_core_exec_on_slave`, `jo_3d_slave_mesh_draw`,
+      `jo_core_wait_for_slave`, `jo_3d_slave_end`): cpu 93-106% -> 54-84%. Only meshes with
+      arrays of their own, drawn once a frame: the slave reads them while the master goes on.
+      jo clears the slave's cache before each job, and both caches write through, so what the
+      master wrote before handing a job over is what the slave sees;
+    - `JO_FRAMERATE = 1`, not `JO_FRAMERATE_DYNAMIC`: in its manual frame change jo clears each
+      frame with a whole-screen polygon, ~4 ms of VDP1, and VDP1 became the limit (48-52 fps at
+      busy 96-100%). Mode 1 lets VDP1 erase for free, but a frame VDP1 can't finish is shown
+      with its nearest commands missing ("vdp1 over" counts them: 0 in every film of play).
+    Now: the yard 60 fps throughout at cpu 40-72%, the doorway 60 (was 30-45), `stairs_perf`'s
+    platform lip 60 (30 even under SGL). There the master waits ~9 ms for the slave: the slave
+    is the busier CPU.
+  - **jo's profiler** (`JO_COMPILE_WITH_PROFILER_MODULE = 1`, `jo_profile_get(JO_PROFILE_3D_...)`)
+    uses the same FRC as `perf.c`, which zeroes it every frame: its clip figure came out as
+    garbage. Timing jo's draw calls with our own `perf_part_add` agreed with its vertex and
+    polygon figures. `JO_TEST_PATH_COUNTS` (in `_CCFLAGS`, then a clean build) fills
+    `__jo_3d_path_counts[8][4]`. jo's profile.c calls `jo_core_exec_on_slave` without the dual
+    CPU module (an implicit declaration warning).
 
 - VDP1 maps a texture onto a 4-corner quad linearly, not in perspective: a circle texture on a
   trapezoid comes out a dome (the user: "a bent bicycle tyre"). For perspective, cut it into
