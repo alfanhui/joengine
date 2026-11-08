@@ -660,7 +660,10 @@ void                jo_dump_vdp2_registers(void)
 
 int     main(void)
 {
-	jo_memset(&_bstart, 0, &_bend - &_bstart);
+	// Zero all of BSS (globals/statics without an initial value). _bstart/_bend are declared as
+	// unsigned int, so subtracting the pointers counts ints, not bytes: that cleared only a quarter.
+	// Emulators hide it (RAM starts zeroed); real hardware/SAROO leave old data behind.
+	jo_memset(&_bstart, 0, (unsigned int)&_bend - (unsigned int)&_bstart);
     jo_memset((void *)JO_WORK_RAM_SYSTEM_WORK, 0, JO_WORK_RAM_SYSTEM_WORK_SIZE);
 	jo_main();
 	return (0);

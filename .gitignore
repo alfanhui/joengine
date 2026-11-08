@@ -12,6 +12,7 @@ game.elf
 game.iso
 game.cue
 game.map
+*.obj
 /jo_engine/*.o
 /Projects/*/*.o
 /Samples/*/*.o
@@ -30,3 +31,9 @@ Emulators/SSF/Setting/*
 /Projects/*.7z
 /Emulators/SSF/Backup/InternalBackup/*.bin
 /Emulators/YabaSanshiro/debug.txt
+Samples/
+Manuals/
+Emulators/
+.vs/
+.vscode/
+x64/
