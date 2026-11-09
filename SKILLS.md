@@ -167,6 +167,51 @@ CLAUDE.md sit in the jo-engine checkout around it.
     Now: the yard 60 fps throughout at cpu 40-72%, the doorway 60 (was 30-45), `stairs_perf`'s
     platform lip 60 (30 even under SGL). There the master waits ~9 ms for the slave: the slave
     is the busier CPU.
+  - **The VDP2 floor (RBG0) on jo 2026** (2026-11-08: the grid ~10x too big, iso lines at odd
+    angles, no sky). jo's maths (vdp2.c `jo_vdp2_set_rotation_matrix`) is right for any matrix,
+    but VDP2's registers aren't: matrix entries A-F are 4 x the texels per matrix unit and VDP2
+    keeps sign + 3 integer bits (under 8, or they wrap); the position (Mx, My) under 8192 texels;
+    and the zoom comes from a table of 128 / address, coarse when the floor is far (big depths in
+    matrix units: bands of rows jump, a dashed grid). Under SGL the floor was drawn in the world's
+    1/4-size matrix: 32.8, wrapped. Now main.c's floor block undoes the world's matrix and does
+    its own: the world at 17/16 (>> view_floor_shift), so 1.93 texels a matrix unit (7.7), and
+    the camera's place within 16 tiles (`floor_wrap`). The sky (plane B, `draw(false)`) is drawn
+    before `jo_3d_camera_look_at`, as in jo's plane sample: after it, the camera's -z made it
+    wholly transparent.
+  - **Single-sided polygons (`JO_3D_SINGLE_PLANE`) face by their winding on screen in jo 2026**
+    (clockwise = front, 3d.c), not by their normal as in SGL. The cycle's cube had its outsides
+    hidden: its faces are now listed the other way round (main.c `load_player_model`). Checked
+    with the top face red and the bottom green, seen from iso.
+  - **A mesh with an 8-bit texture takes the current sprite palette** (`jo_3d_set_mesh_polygon_texture`
+    sets `color` from `jo_sprite_set_palette`'s), not the texture's own: the cube came out near
+    black on jo 2026's bank 0. It's given WALL1.TGA's palette (`plane1_palette_id`). WALL1.TGA is
+    navy and purple with white outlines: the grey cube of the SGL builds was another palette by
+    accident.
+  - **A `JO_3D_SORT_PREVIOUS` chain needs its first polygon drawn.** jo skips a polygon that's off the
+    screen before giving it a key, and the chain then takes the key of whatever came before it in
+    that CPU's list (on the slave: near 0, the nearest there is). The glass floor's anchor, a dot at
+    its deepest point, sat on the edge the floor's cut to (frustum.h's sides are a little wider than
+    the screen): facing across the corridor the whole floor was drawn over the grey boxes and the
+    map. It's now straight ahead at that depth (level.c `level_ahead`; floor_chain.steps films it).
+    Not jo's clipped-part rule (after a polygon cut into parts, `previous_polygon_z` becomes its
+    nearest corner): changing that in 3d.c made no difference here.
+  - **Arena wall textures need jo's texture tiles near the camera**: jo cuts a polygon that goes past
+    its guard band (512 px; SGL allowed 1023, which `wall_clip` was tuned to), and VDP1 stretches
+    the whole texture over the cut shape: a band of horizontal lines atop the near wall and a step
+    in its foot. `jo_3d_set_texture_subdivision_near_only` on the three wall textures (level.c)
+    cuts those polygons into textured tiles instead. edge_1st.steps' `edge_1st_along` shows it.
+  - **Mednafen open on game.iso makes every build fail**: make's clean can't delete it ("Error 1",
+    not ": error"), the old disc stays, and films ran on it unnoticed. run_e2e.ps1 and
+    film_round.ps1 now stop unless game.iso is newer than the build's start.
+  - **The walker's traps are found faster on the PC than in films**: random walks over the real
+    corridor, boxes and city (`corridor_walker_area`), checking every so often that 8 headings
+    still lead somewhere. It found landings that leave you inside a wall's 40-unit margin, where
+    every step had counted as into the wall (fixed: `wall_in_way` in walker.c). No gcc on this
+    machine or in the e2e container: build such a probe with MSVC (vcvars64, as run_tests.bat).
+  - **run_e2e.ps1's rebuild stopped on a compiler warning**: under `$ErrorActionPreference = "Stop"`
+    the warnings on a native command's stderr raise. Join them inside cmd (`compile.bat 2>&1`).
+  - **A film chained after a build with `&&` didn't run**: the PowerShell build step's exit code
+    stopped the chain, and the old shots looked like "no change" twice. Check the shots' times.
   - **Pushing from this machine**: no SSH agent, so `git push` to the SSH remotes fails. `gh` is
     signed in: push one branch over HTTPS without changing any git config with
     `git -c credential.helper= -c credential.helper='!gh auth git-credential' push https://github.com/alfanhui/joengine.git <branch>`.
