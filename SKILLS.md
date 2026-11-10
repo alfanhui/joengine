@@ -211,6 +211,13 @@ CLAUDE.md sit in the jo-engine checkout around it.
     (drawing all of it cost 41% of a frame). jo's polygons are dual-plane, so the flipped winding
     doesn't cull them. To see where a second pass lands, paint it one flat colour for a build:
     the dark corridor reflected looked like nothing at all until it was green.
+  - **Every polygon is ~0.45% of a frame of jo's work, whoever draws it** (2026-11-10): the body's
+    28 polygons in the mirror cost 12% on the master, and the same handed to the slave (the
+    mirror pass already keeps it busy, and the master waits for it). Count polygons before
+    anything else; a rim as a chained polyline doubles a thing's count.
+  - **Finer than whole units with the same clipper** (level.c, `level_body_draw`): the frustum's
+    planes are measured from the eye, so a copy with the eye and every offset x16 cuts points
+    given x16. Near the eye a whole unit is 8 pixels: the body's joints would judder without it.
   - **run_e2e.ps1 builds only when it switches BOOT_ON_FOOT** (a `wait_boot` film on an on-foot
     build, or the reverse). Otherwise it films whatever game.iso is there: after changing code,
     run `scripts\compile.bat` first. To film old code against new, put the old file in place with
