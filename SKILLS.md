@@ -203,6 +203,19 @@ CLAUDE.md sit in the jo-engine checkout around it.
   - **Mednafen open on game.iso makes every build fail**: make's clean can't delete it ("Error 1",
     not ": error"), the old disc stays, and films ran on it unnoticed. run_e2e.ps1 and
     film_round.ps1 now stop unless game.iso is newer than the build's start.
+  - **A mirror on VDP1 is the scene drawn twice** (level.c, 2026-11-09): reflect the frustum
+    (flip the plane normals on the mirror's axis, eye too: offsets stay, they're from the eye),
+    cut the world as it is to that, then draw it inside a reflecting matrix (translate, scale -1,
+    translate back). The glass's outline goes in the screen planes' slots, so all existing cuts
+    honour it; the reflected eye's near plane is spare, so it became the reflection's depth limit
+    (drawing all of it cost 41% of a frame). jo's polygons are dual-plane, so the flipped winding
+    doesn't cull them. To see where a second pass lands, paint it one flat colour for a build:
+    the dark corridor reflected looked like nothing at all until it was green.
+  - **run_e2e.ps1 builds only when it switches BOOT_ON_FOOT** (a `wait_boot` film on an on-foot
+    build, or the reverse). Otherwise it films whatever game.iso is there: after changing code,
+    run `scripts\compile.bat` first. To film old code against new, put the old file in place with
+    `cmd /c "git show HEAD:path > file"`: PowerShell's `git show | Set-Content -NoNewline` joins
+    the lines into one, and the first `//` comment swallows the rest (a failed build, 2026-11-09).
   - **The walker's traps are found faster on the PC than in films**: random walks over the real
     corridor, boxes and city (`corridor_walker_area`), checking every so often that 8 headings
     still lead somewhere. It found landings that leave you inside a wall's 40-unit margin, where
