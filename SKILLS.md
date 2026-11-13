@@ -949,6 +949,202 @@ Also in `Manuals/`:
   front left its outline (added after it) before it, and the tile covered it. The glass floor's
   chain hangs off a dot at the floor's deepest point (`glass_anchor`: a quad with four equal corners).
 
+- **A polygon left half filled, a wedge, is VDP1 running out of time, not a clipping bug.** With
+  `JO_FRAMERATE = 1` an unfinished frame is shown as it is, and VDP1 draws back to front: the
+  *nearest* polygon (the floor at your feet) is the one cut short, part way through its fill
+  lines, so it looks like a diagonal cut that changes as you turn. Check the debug line's
+  `vdp1 over` before looking for a cut (2026-11-12: the CD block hub's roof). The debug line's
+  figures lag about a second: after a turn they still show the last view's.
+- **Low in the city, towers are sides, not tops.** From above you see roofs (small). From below
+  every tower's side fills a screen column: overdraw is the cost, and hiding (`game/skyline.h`:
+  2D, on the floor plan, a tower behind a nearer taller one) is what helps, not cheaper cutting.
+  Pick hiders by near *and* tall: the nearest towers at a hub are low and hide nothing.
+- **Far landmarks: polygons at real places, not a sky picture.** A VDP2 sky image is free but at
+  infinity: no parallax by position, nothing hides it, and one landmark can't be left out. A
+  cutout of 2-6 flat polygons 20 000 away gets all three from the pipeline that's already there
+  (`game/landmarks.h`). What to mind: world coordinates must stay under 32 768 (jo's 16.16), so
+  under ~30 000 from the arena's middle; only draw them where there's a view to cut to
+  (`level_view_on`: 1st person), or every one behind the camera still costs jo ~0.45% a polygon;
+  and anything below the arena's floor shows *in front of the walls* from the arena (the floor is
+  VDP2, behind every polygon): start such things at z 0 there.
+- **cpu over 100% with little to show for it: look at who's waiting.** The part timers
+  (`perf_part_add`) and `cpu` are the master's clock, and include the time it waits for the
+  slave at `slave_draw_end`. jo says how long: `jo_core_master_wait_time()` (microseconds; the
+  debug screen's `mwait`) and `jo_core_slave_idle_time()` (`sidle`: negative when the master
+  waited). At the CD block's hub the master waited 4-21 ms a frame (of 16.7) for the slave to
+  draw ~40 big tower faces; drawn on the master instead, cpu 99-163% became 48-82%
+  (2026-11-13). Hours went on trimming code that was a third of the cost: read `mwait` first.
+- **Time by parts before optimising, and split a part again when it's big.** Three temporary
+  `perf_part_add` timers inside one function (borrowing the debug line's unused parts) found the
+  costs in minutes; guessing from instruction counts was out by 2-3 times every time. On the
+  SH-2 (Mednafen's timing) a rejected candidate in a loop costs ~100-300 cycles, a face built
+  ~1500: 84 towers a frame is a lot, 40 polygons isn't.
+- **What depends only on where you stand, work out ahead.** Which towers hide which never
+  depends on which way you look, and the city's static: `city_seen` (a bit per tower per quarter
+  roof, made by a PC tool from city.c's own table) replaced a per-frame search. A unit test that
+  works the table out again with the game's code, bit for bit, keeps the tool honest and fails
+  when the table's stale. A whole roof was too wide a patch (65 of 84 still seen): quarter it.
+- **VDP1 reads a sprite's whole texture however small it's drawn**, unless high speed shrink is
+  on (`jo_3d_set_mesh_polygon_high_speed_shrink`; CMDPMOD bit 12, VDP1 version 1). A ring of 16
+  strips of a 128 x 64 texture, each ~70 x 66 pixels on screen, cost VDP1 its frame at the hub
+  (37 fps with, 60 without); with it on, fine. Mednafen models the saving.
+- **Films drive the pad by timed key presses and aren't exact:** the same film turned different
+  ways on two runs (`hub.steps`). Compare runs by what a shot shows, not by its number; for an
+  A/B, stand still (`corridor_still.steps`).
+- **Two pictures in one 8-bit tile, picked by palette.** A VDP2 plane's tile can hold two
+  patterns at once: index = pattern A's value x (B's count) + pattern B's value. A palette that
+  colours by `i % B` shows one, a palette that colours by `i / B` the other. Switching is a
+  palette write (256 colour RAM words), not a CD read and a second tile in VRAM: the arena's grid
+  and the city's circuit board share FLOOR.TGA (`tools/make_floor.py`, game/board.h). Leave
+  index 0 as the background of both. A unit test reads the TGA and checks the palette as loaded
+  depends only on `i % B`, so the arena can't see the board.
+- **Palette cycling for movement for free:** give the texels along a trace a phase class each
+  (32, by distance along it), light a few and move them on: pulses run along every trace for
+  ~180 colour writes every 4 frames, nothing redrawn (game/board.h).
+- **The floor drawn larger than 16 times (`view_floor_shift` 5):** `floor_wrap`'s repeat must
+  be whole tiles (FLOOR_WRAP << (shift - 4)), or the floor jumps as you cross it. Fine detail
+  seen from far up must be ~10 texels wide or it's a 1-2 pixel speckle (the board at shift 4 from
+  the hub).
+- **The floor fog's colour is one colour RAM entry** (the line colour table names it on every
+  row): `floor_fade_set_colour` turns the whole fog at once. Keep a copy to compare: don't read
+  colour RAM back. A black floor fogged blue is a blue floor: change the fog with the floor.
+- **VDP1 walks what's off the screen too: trim each end of a long face by its own distance.**
+  A tower's side trimmed to the screen's height by its *further* end's distance reaches far past
+  the screen's top and bottom at its near end (inside the guard band, so nothing cuts it), and
+  VDP1 walks every pixel of it. Trimmed end by end (a trapezoid, the same plane) the hub went from
+  30 fps to 60 with nothing else changed (2026-11-13). An A/B that shows "no difference" when the
+  films' own swing is 36-60 fps hasn't shown anything: the cost was there, hidden by missing
+  skyline strips.
+- **A bug can be hiding a cost.** The skyline's strips went missing on turns; fixing that put the
+  whole ring on screen and the frame rate halved. When a fix makes things slower, A/B the parts
+  (`if (1) return;` in each, one film each) before blaming the fix: here the pyramid and the ring
+  were both innocent.
+- **A textured ring's strips: under 20 degrees wide on foot** (the screen's edge is 37 degrees
+  aside, the guard band's 57), or whole strips go as you turn or look up. Halve a strip by
+  cutting its picture into two sprites (`jo_sprite_add_tga_tileset` with two `jo_tile`s), not by
+  repeating the picture twice as often.
+- **Painter's order and one very big face:** a piece of a huge face cut to the view sorts by one
+  depth, and can come out over the wall and floor it's behind. Don't draw the part that's hidden
+  anyway (the pyramid's slope below the corridor's walls, from inside it), and chain what must
+  follow a face to it (`JO_3D_SORT_PREVIOUS`: the disc on the mirror's far wall, 13 000 beyond it).
+- **The film boots facing out of the corridor** (the debug line's heading says W): `hold left 1.6`
+  is the half turn to face the mirror, and it lands a little off.
+- **Hand the slave work, not only drawing** (`slave_draw_job`, src/slave_draw.h): jo's slave
+  draws a mesh it's given, but building it (testing, cutting, fogging each tile) stayed on the
+  master: 23-28% of a frame for the glass floor while the slave idled 4-10 ms (`sidle`). As a job,
+  the floor went to 3% on the master and the corridor to 60 fps. Before moving code: list every
+  global it writes (`level_cut_exact`, object_fog's table count were the two here) and keep those
+  parts on the master; what it reads must not change until `slave_draw_end`.
+- **From the CD block hub (`BOOT_AT_HUB 1`) you face west; the arena and its pyramid are east.**
+  `lift.steps` turns N, E, S and never faced it squarely: `lift_pyramid.steps` turns on the pad.
+  A film meant to show something: check that the thing is in its shots before comparing builds.
+- **`level.c` can be locked by another program for a moment** ("a user-mapped section open"):
+  an A/B script's write then fails with nothing changed. Run it again.
+- **Order the slave's jobs to overlap the master's work**: a job queued last in a pass only
+  moves the wait (the master reaches `slave_draw_end` and waits for it). Queued first, it runs
+  while the master builds the rest: the body in the mirror, moved to the front of the pass, took
+  the mirror from 46-55 fps to 56-61.
+- **A film's held turn depends on the frame rate**: the corridor at 60 fps turned a 1.6 s hold a
+  quarter further than at 53. After a speed-up, re-check the films' headings (debug line 3).
+- **Count with a timer slot**: `perf_part_add(PERF_BANDS, jo_time_get_frc() - 149)` adds about
+  1% of a frame (a frame's ~14 900 FRC ticks) each time it's called, so the debug line's `bd` reads
+  a count (the most in a frame, that second). Found that the boxes sent only 5-11 city sides a frame
+  from the corridor while their part took 31-59%: the cost was deciding, not drawing.
+- **Mednafen's films are deterministic**: the same build and film give the same digits. A variant
+  that reads digit for digit as the last one changed nothing on screen or in time (the pyramid
+  handed to the slave: it isn't drawn in the corridor at all). The debug line's `late` counts up
+  over the run; it doesn't reset each second.
+- **Work it out ahead, not "once" in the game**: one pass over 84 towers x ~27 hiders x 2 eyes with
+  the game's own hiding code was ~60 ms on the SH-2 (3 late frames as the corridor opened; spread
+  12 towers a frame, 11). As a generated table (`tools/make_city_seen.py`), it's one bit test.
+  Something that depends on the round (the corridor's width) can still go ahead: work it out for
+  the widest case if a wider one only sees more.
+- **"The floor's clipping" on foot is VDP1 not finishing.** With `JO_FRAMERATE = 1` an unfinished
+  frame is shown with its last commands missing, and the roof under you is nearest, so last:
+  it's cut off in a wedge. Read the debug line's `vdp1 over` where it's seen; any count is this,
+  and the cure is less fill, not a clipping fix. Two films in the wrong places showed nothing:
+  it's only in the views with the most overdraw (from the hub, south and east along the rows).
+- **Cut a partly hidden side back to what shows** (`skyline_trim`): leaving out only what's
+  wholly hidden still fills every sliver's whole side. Where a side comes out of a hider's
+  shadow is found by halving with the same in-the-shadow test (cross products), six steps: no
+  division, and it stops inside the shadow, so it errs towards drawing.
+- **.NET file calls in PowerShell don't follow `Set-Location`:** `[System.IO.File]::ReadAllText`
+  with a relative path goes by the process's folder. Give them full paths.
+- **A textured quad can't be cut: keep it narrow instead.** Cut by the view, VDP1 stretches the
+  whole texture over the piece, so a textured strip (the skyline, level.c) is drawn whole or not
+  at all. Drawn whole, a wide one beside you reaches far past the screen (jo cuts past its guard
+  band with the CPU; VDP1 walks the off-screen pixels): 16 skyline strips 6500 off were 46 degrees
+  each, 30 fps. Make them narrow enough from the nearest place you can stand (~25 degrees), and
+  skip any that crosses the guard band.
+- **The corridor has no headroom:** cpu 99% at 60 fps before anything is added; ~30 sky polygons
+  took it to 48-51. A/B with the new thing switched off (`if (... || 1) return;`), same film, is
+  the only honest measure: films that walk by time (`city.steps`) stall when the frame rate drops.
+- **Films keep old shots:** `run_e2e.ps1 -Out folder` adds to the folder. Rename a film's shots
+  and the old names stay and land on the contact sheet: clear the folder first.
+- **Docker Desktop isn't always up:** `docker` then fails with "failed to connect to the docker
+  API ... dockerDesktopLinuxEngine". Start `C:\Program Files\Docker\Docker\Docker Desktop.exe`
+  and wait for `docker info` to answer (about a minute) before filming.
+- **`BOOT_AT_HUB 1`** (input.c, with `BOOT_ON_FOOT 1`) stands you on the CD block's hub, 150
+  short of the lift's pad: films `hub.steps`, `lift.steps`. Both 0 to commit.
+
+## Other people's Saturn work: what they measured
+
+### Tomb Raider from 12 to 30 fps (AJBats, devlog video, read 2026-11-11)
+
+<https://youtu.be/xIRVa_ZVdvY>, source <https://github.com/AJBats/saturn-tr-remix> (libyaul, not
+jo; OpenLara's game logic on a renderer of their own). Their figures are on a real Saturn, at
+30 fps; ours is a 60 fps game, so a millisecond is worth twice as much here. None of this is
+measured in our game yet: docs/BACKLOG.md has the rows ("From the Tomb Raider devlog").
+
+- **Two deadlines, and VDP1's is the earlier.** VDP1 has to finish before the TV's blanking gap:
+  30.9 ms of a 33.3 ms frame for them. Miss either and you lose a whole vblank (30 to 20 fps; for
+  us 60 to 30). They started at 75 ms of VDP1 and 43 of CPU.
+- **VDP1, in the order they won it:**
+  - High-speed shrink (HSS, see "VDP1: what a polygon costs") on: free speed, a little less
+    clear at distance. Flipped on and off in a still you can barely tell; in motion, a little.
+  - **Mow the lawn the long way.** VDP1 fills a face as lines from its A-D edge to its B-C edge,
+    and each line costs time to start. Give it the corners turned a quarter so the lines are
+    fewer and longer. VDP1 can mirror a texture for free but can't turn one, so a turned
+    textured face needs a turned copy of its texture in VRAM: memory for speed. Done for the
+    level first, then for characters and objects: 3 ms more. **An untextured polygon has no
+    texture to turn: it's free.** (Our `lay_wide_pieces_flat` is this, for the walls.)
+  - Mipmaps (half and quarter size copies): VDP1 reads fewer texels. With HSS that's six levels
+    of detail. Memory for speed again.
+  - Gouraud costs: where a polygon's four corners have the same light, darken its colours and
+    turn shading off. 3 ms.
+  - VDP1 clears part of the screen for free in the blanking gap, but not all of it, and clearing
+    the rest is dear. Cheaper: make the level airtight, so polygons cover the screen anyway.
+    (Ours can't: the floor and sky are VDP2, so VDP1's frame must be clear where they show.)
+- **Two CPUs, one bus:** they slow each other a little, and both busy is still a net win. But
+  **a CPU waiting for work must not spin on the bus**: starting the second CPU's work sooner
+  helped little because it was "flooding the bus with noise" while it waited.
+- **Small CPU wins, about a millisecond each:** hot work and data in fast RAM (Work RAM-H; a
+  level's data stretched across fast and slow RAM was moved wholly to fast); touch the bus less
+  (keep the hot loop's code and data in the SH-2's 4 KB cache: Kaze Emanuar's N64 advice);
+  compile most code for size and hand-pick the hot files for speed. Their compiler test
+  (docs/compiler-bakeoff.md there): GCC 8.4, 9.3 and 14.2 within 3% of each other; `-Os` 1-2%
+  slower than `-O2` in the hot loops and 25% smaller (30 KB). Their C vertex transform cost
+  ~270 cycles a vertex: hand-written SH-2 moved far more than any compiler flag.
+- **The SCU DSP:** their first vertex program was 147 instructions a point and still saved
+  frame time end to end; Sonic R's is about 14. The lesson from Sonic R: don't treat it as a
+  CPU. Give it only what it's good at, whole rooms or models as one job, four points at a
+  time, so it never stops to wait. Even so there was little for it to do.
+- **No second pass.** The renderer they inherited (32X: the CPU draws) listed every face, then
+  came back to draw. With VDP1, each face writes its draw command the moment it's made.
+- **Small things cost what big things cost.** A model in segments costs per segment however
+  few pixels it covers: the rat had more geometry than the T-Rex. Join segments at viewing
+  distance; a bridge's 3D ropes became sprites facing the camera.
+- **Look for work that's thrown away.** They coloured red every polygon the CPU processed and
+  then discarded: a room with a sliver in view was processed whole; the visibility walk
+  visited rooms several times; a hidden crocodile was drawn.
+- **A pipeline stage for the second CPU:** it runs the *next* frame's game simulation while
+  the main CPU builds this one (from Norton's Doom devlog), so the work is spread over more
+  time. The cost: the pad is read a frame early, 24 ms more latency. For a game whose first
+  rule is the controls, that's the wrong trade unless nothing else is left.
+- **Compare like with like:** OpenLara's camera saw less than the retail game's, and it let
+  near polygons warp instead of clipping them. Restoring both cost them their 30 fps again. A
+  number from another engine carries its camera and its clipping with it.
+
 ## Reference projects in this repo
 
 - **`Projects/FPS Collision demo`** (XL2, 2017: a rough first-person demo with walls, floors,
