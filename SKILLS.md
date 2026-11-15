@@ -59,7 +59,7 @@ CLAUDE.md sit in the jo-engine checkout around it.
     debug camera by hand (`hold c`) gave a useless shot. To see a later round:
     `tests\e2e\film_round.ps1 -Round N [-Steps x.steps]` (builds with `BOOT_ROUND` flipped,
     films, makes a sheet, puts it back).
-  - `run.sh` reads `BOOT_SCENE` from `src/input.c`, so `skip_prologue` (to play) and `start_intro`
+  - `run.sh` reads `BOOT_SCENE` from `src/features.h`, so `skip_prologue` (to play) and `start_intro`
     (to the opening flight) work whichever part the game boots into. A new prologue script starts
     `wait_boot`, then `start_intro`.
 - Text printed with `jo_printf` stays on VDP2's text layer until it's written over: when a part
@@ -67,6 +67,60 @@ CLAUDE.md sit in the jo-engine checkout around it.
   out, or the last message stays up.
 - Turn camera GIFs: `tests\e2e\turn_gif.ps1` (check both rows start on the same turn frame).
 - Fast boot on the PC: `scripts\run_fast_boot.bat` (YabaSanshiro's emulated BIOS skips the intro).
+- **The benchmark is the frame-rate gate** (docs/BACKLOG.md SG-5, `src/game/bench.h`):
+  `tests\e2e\run_e2e.ps1 -Steps bench.steps` (~3 min). One build (`BENCH 1`) boots on foot, goes
+  round a fixed list of views with no pad, and ends on a green or red screen with a line a view.
+  The script exits 0 green, 2 red, 3 no verdict. Run it before and after any change that could
+  cost frames; add a view for any new slow place, marked `known` until its row is done.
+  - `wait_verdict` reads the colour relative to the other channels: text and the black border
+    pull the average down (green read ~(37, 156, 70)), and an absolute "G > 90, B < 70" missed it.
+  - Making a bench film: `run_e2e.ps1` replaced every `#define BOOT_ON_FOOT n` line in
+    features.h, an `#undef`/`#define` pair inside `#if BENCH` too. Put build-dependent logic in
+    code (`BOOT_ON_FOOT || BENCH`), not in a second define the scripts' regex will hit.
+- **Glitch checks on every frame** (SG-6, `tests/e2e/glitch.py`, proof film `flash_look_up.steps`):
+  a `record` line records every frame (Mednafen `-qtrecord`, PNG codec); `flashes_from` /
+  `flashes_to NAME` checks the stretch for one-frame flashes and stray colours, `holes_from` /
+  `holes_to NAME` for the magenta back colour (`GLITCH_CHECK` build). A fault exits the film 4.
+  Unit tests: `python tests/e2e/test_glitch.py`. Pure Python decodes a 704x480 frame fast enough
+  (~150 frames in 2 s).
+  - A VDP1/VDP2 mismatch during a move lasts the whole move, not a frame: compare colours against
+    the still frames, not each frame against its neighbours. Hold still before and after a move.
+  - Record with `-ss.correct_aspect 0`, or frames come out 10560 pixels wide and Mednafen crawls.
+  - A colour-polling wait (`wait_up`) can be fooled by a build's own test colours: magenta is
+    "more red than green" too. Bound the brightness.
+  - Steps files must be LF: one written by Python in text mode on Windows gave `record\r`, and
+    run.sh said "unknown step: record".
+- **What fills VDP1: measure pixels by part** (SG-7): set `JO_COMPILE_WITH_PROFILER_MODULE = 1`
+  in the makefile and the debug line's row 9 shows VDP1's pixels by part (`px`, utils/perf.h).
+  - **A make variable with a comment after it keeps the space:** `X = 1 # note` is `"1 "`, and
+    jo's makefile tests `ifeq (1,${X})`: the profiler silently wasn't built. Comments go on their
+    own line.
+  - jo's pixel estimate is per CPU (`__jo_profile_cpu[n].sum[JO_PROFILE_3D_PIXELS]`, never reset):
+    split it with differences at marks; read the slave's through `JO_CACHE_THROUGH`, after
+    `slave_draw_end`.
+  - In the city the towers are ~85% of VDP1's pixels; the optional parts a few %. A smaller guard
+    band did nothing there: our own cuts already keep the walls to the screen.
+- **A roof cut off diagonally is VDP1 not finishing**, not a floor fault: jo sends far first and
+  near last, so the roof underfoot is what's missing. The draw budget (game/draw_budget.h) leaves
+  out the landmarks, then the arena, after a miss. Benchmark views stand still and can read
+  `over 0` where running there misses: `roof_cut_run.steps`, the debug line's `over N/T` total.
+- **Building or fixing a level for VDP1: follow docs/LEVELS.md** (Projects/circuit-breaker): the
+  pixel budget (~350k jo-estimated a frame), the order to leave things out, and the checks. The
+  worst frames are mid-jump (nothing hides the gap's depths), not standing views.
+- **What the floor you stand on hides** (`game/floor_hides.h`): a convex cone from the eye through
+  the floor. For an upright face, the hidden height at each end, joined straight, is safe (the
+  hidden height is concave along a wall). Prove such rules with a soundness test against an exact
+  answer (doubles on the PC): its first run found the floor's own height wrongly called hidden.
+  **Test whole faces, not only points.** The point test passed while the game cut a wedge out of a
+  wall. Each end was raised to the higher of the face's own foot and the hidden height, then joined
+  straight; that max has a corner, and the line cut across it. `floor_hides_line` takes a limit only
+  as a whole line, above the foot at both ends. Found by comparing shots with `FLOOR_HIDES 0`,
+  then printing the side's numbers with `jo_printf` in a mirrored copy.
+- **Before making a draw optional, see what's in it**: the draw budget's "landmarks" left out
+  `level_sky_draw`, which also builds the skyline ring, and the sky's pink horizon showed on roofs.
+  Check it with the budget forced on (`budget.dropped = BUDGET_PARTS` for one build).
+- **Films can boot on the hub**: `boot_at hub` (BOOT_AT_HUB). `boot_at 0010` stands you on the
+  lift's pad, and the lift takes you up at once.
 
 ## Editing files here
 
@@ -373,10 +427,129 @@ CLAUDE.md sit in the jo-engine checkout around it.
   staring at the real effect.
 - The jo build's interrupt vector table (VBR) is the BIOS one at 0x06000000; `SYS_SETSINT`
   writes there. GCC's `__attribute__((interrupt_handler))` makes correct SH-2 handlers.
-- jo's `jo_sound.sample_rate` is not Hz: SGL passes it to the SCSP as its raw pitch word (OCT in
-  bits 14-11, two's complement; FNS in bits 9-0; rate = 44100 x 2^OCT x (1 + FNS/1024)). 0 is
-  44100 (why Shenmue's sound worked: it never set it); 22050 is `0xF << 11`. Passing 22050
-  played 20x too slow: a ping became a long rumble heard "after" the press.
+- jo-engine 2026's `jo_sound.sample_rate` **is Hz** (audio.c, `__jo_scsp_pitch` makes the SCSP's
+  pitch word from it). Under SGL it wasn't: SGL passed it to the SCSP as the raw word (OCT in
+  bits 14-11, FNS in 9-0; 22050 was `0xF << 11`). That word, left in after the move, was read
+  as 30720 Hz: every sound 1.39x fast, 6 semitones high, for days, unnoticed. Measured with
+  `record_sound`: each sound's length in the recording, old value against new (0.45 s vs 0.65).
+  After an engine move, re-check every value whose units the old API defined.
+- **The build's switches are in `src/features.h`** (since 2026-11-14): boot (`BOOT_SCENE`,
+  `BOOT_ROUND`, `BOOT_ON_FOOT`, `BOOT_AT_HUB`), what's drawn (`SHOW_SKY`, `FLOOR_FOG`,
+  `WALL_TRAIL_FOG`, `CYCLE_SHAPE`, `CITY_SIDES_TO_BOARD`), sound (`SFX_ON`) and debug
+  (`SHOW_FLIGHT_DEBUG`). The film scripts read and set lines there. To flip one for a test build,
+  `sed -i` in Bash, never PowerShell's `Set-Content` (a byte-order mark); and in a Python
+  heredoc, a Windows path's `` is a form feed: write the script to a file, or build the
+  bytes.
+- **Some switches are also live, in the pause menu** (START; `src/game/settings.h`): debug text,
+  flight text, sound, cycle shape, city sides, no termination. For those, features.h is only the
+  boot value: code reads `settings_on(&game_settings, ...)`, not the macro. A switch can go live
+  only if changing it mid-game costs nothing: sky and fogs set VDP1/VDP2 up once (an image, DMA
+  tables, Gouraud quads), so they stay build-only. Paused, L/R are the menu: the camera's height
+  is B + up/down and its pitch C + up/down; the menu hides while the d-pad flies the camera, so a
+  film's paused shots stay clear once it has moved (until L or R).
+- **The text layer keeps what's printed**: print a menu only when it changes (keep a copy of
+  what's on screen and compare), and blank its rows once when it closes. A VDP1 panel behind it
+  must be drawn every frame. In Git Bash, `sed -i` and `perl -pi` both failed silently on
+  `run_tests.bat` and the makefile here: use the Edit tool for those.
+- **The watchdog drone** (`game/drone.h`, `drone_draw.c`, 2026-11-14):
+  - **See-through on the Saturn is VDP1 mesh, not half-transparency**, for anything in front of
+    the floor or sky: half-transparency only blends over VDP1's own pixels, so over VDP2 it draws
+    solid.
+  - **Measure a new thing's own cost on its own timer:** `perf_part_add` with a part of its own
+    (row 7 of the readout: `dr dm ds`), not by comparing two films. Two runs of the same steps
+    can land somewhere else (a run and jump), so their whole-frame figures don't compare. A film
+    that skips the new part's drawing (`if (0)`, put back after) is the clean A/B.
+  - **Out in the city the CPU is at 85-95% already**, so anything new there has to be nearly
+    free. A sheet of 8 triangles and 11 lines cost ~10%, the model ~10%. Its replacement, one
+    beam triangle and a few lit roof patches, costs 4-7%.
+  - **Colouring part of a face VDP1 already draws:** add the patch right after that face in the
+    same mesh, `JO_3D_SORT_PREVIOUS`, cut by the same planes (level.c, `scan_lit_add`). Sorted on
+    its own, a coplanar patch can come out under its roof.
+  - **Mirroring a plan for the page only:** map world x right to left in its `X()`, and take each
+    rectangle's left edge from its east side (x1). The moves, heights and C table stay put
+    (`tools/work_ram_plan.py`).
+  - **When the CPU runs over, VDP1's `over` climbs too.** VDP1 is started late, so it misses the
+    swap. Rule out the CPU before blaming VDP1's fill.
+  - **The slave doesn't help out in the city:** handing it the drone's meshes made the master
+    wait ~17000 ticks (`mwait`), 38 fps. That's the same as level.c found for the towers.
+  - **A distance from `frustum_distance` is x1024.** Multiply it by a coordinate difference and
+    it passes 32 bits: shift both down before a cut's share (`scan_line_cut`).
+  - **On foot, right turns go N, E, S, W, and east is -x.** Facing south, +x (west) is on your
+    right. The drone was "on the wrong side" only because the walker faced 30° off south: check
+    with a host program that prints the positions (scratch C, built with `cl` from a .bat that
+    starts `CD /D "%~dp0"`).
+- **Filming a spot in the city:** put `boot_at 0650` (a tower's address on the plan) at the top of
+  the steps. run_e2e.ps1 builds with `BOOT_ON_FOOT 1` and `BOOT_AT_TOWER 0x0650` (stood in its
+  middle, facing back towards the corridor), then puts both back. The debug text's `at` shows the
+  tower you're on.
+- **run_e2e.ps1 puts back what it found, not the commit settings.** If an earlier run left
+  `BOOT_ON_FOOT 1`, or something left `BOOT_SCENE SCENE_PLAY`, it stays that way. Check
+  features.h before committing.
+- **Read a film's frame-rate drop part by part before guessing.** `fl` (the floor) at 14-17% in
+  the city was mostly not the floor: its timer also covers `level_view_begin` and the drone's lit
+  roofs. Time a suspect on the `dr` slot for one film (it reads 0 otherwise).
+- **Building while Mednafen holds game.iso** (make's clean can't delete it, and the user's emulator
+  isn't ours to close): mirror the project to a sibling folder, `robocopy <project>
+  ..\cb-film /MIR /XD tests\build .git /XF game.iso`, and run run_e2e.ps1 or film_round.ps1 from
+  there, with `-Out` back in the project's tests\build. The game in the user's emulator stays the
+  old one until they close it and build.
+- **VDP2 shows what you set two frames before VDP1 shows its picture** (jo-engine 2026, dual CPU):
+  the slave sorts and copies a frame's VDP1 commands during the next frame, VDP1 draws them, then
+  they're shown, while VDP2's rotation parameters and per-line tables take effect at the next
+  VBlank. A sudden pitch step showed the sky's horizon a frame apart from the city (the pink
+  band). Draw VDP2's planes with the camera of two frames ago (view.c, view_vdp2_frame) and hold
+  its table rebuilds as long. One frame of delay wasn't enough: measured with shots 0.05 s apart.
+  **Since jo `5b1dbac` (#111, merged 2026-11-15) jo does this itself** for the scroll registers
+  and rotation parameters set in `jo_core_run()` callbacks: they're applied with their frame's
+  VDP1 picture. So the planes take this frame's camera (`VDP2_PLANE_DELAY 0`); a delay now makes
+  them lag. Still ahead: anything written to VRAM from your own VBlank callback, the zoom, and
+  anything set before `jo_core_run()`. A fixed delay for those (our fog had `FOG_TABLE_DELAY 2`)
+  is wrong whenever a frame runs late, and in the city many do. The fog flashed unfogged floor
+  when you started to look up. **Do as jo's glows do:** tag what you build with
+  `__jo_vdp1_frame_tag()`, and in your VBlank callback switch to it when
+  `__jo_vdp1_displayed_frame_changed(&tag)` says that frame is shown. Our callbacks run after jo's
+  VDP1 VBlank step (core.c), so the answer is this field's. Both are jo internals: declare them
+  yourself (floor_fade_vdp2.c, `game/floor_fade.h` floor_fade_tables). **But measure the offset.**
+  By the code, the fog for the frame shown should match the floor; in Mednafen only the fog for
+  the frame shown + 1 did (`FOG_LEAD`). Found by trying offsets −1, 0 and +1 against the stray-colour
+  check on `flash_look_up.steps`, and by printing jo's tags on screen: built 1511, shown and applied
+  1508. A guess at a pipeline's depth is a hypothesis; the film is the test.
+- **A portal cut to its own edges can run far off the screen**: up close the mirror's glass is
+  bigger than the screen. Cut each side at the tighter of the portal's edge and the screen's.
+- **A jo mesh costs by its points as much as its polygons**: jo turns and projects every point in
+  software (a division each), on screen or not. The drone's far model at 37 polygons but 74 points
+  was still 8-10% of a frame; at 42 points, 7. A far model needs its own short point list
+  (drone_draw.c renumbers its polygons' corners to one), not the near model's.
+- **Timing a part's pieces on foot**: `bots` and `trl` on the debug's second line read 0 on foot,
+  so `perf_part_add(PERF_BOTS, frc)` / `PERF_TRAILS` around two suspects shows them for one film
+  (and `bd`, the bands, is 0 there too). Take them out after: they add into a real figure in the arena.
+- **Filming something you can't make happen on purpose** (a fall into a street): build with the
+  test loosened for the film only (walker_fell_off: any drop over 40), film, put the file back,
+  and rebuild: run_e2e.ps1's last rebuild still has the loosened code in game.iso.
+- **Jumping up to a ledge**: walker.c's `catch_ledge`, in the air against a side whose top is in
+  `WALKER_CLIMB`, and higher than you jumped from. Without the "higher" a gap too far was caught
+  short, and how far a jump reaches changed (test_walker's gap test caught it).
+- **A test on one axis is a band across the whole world.** "In the doorway" was `out` within 40
+  of the corridor's end, with no check on across: 2900 to the side, on a city roof, it switched
+  the whole city off. When a state's decided by a distance along one axis, ask what else in
+  the level has that coordinate. Found by printing the state in a film (`jo_printf` a row
+  under the debug lines, crop that row from every shot), not by reasoning about the picture.
+- **To match a sound in a video you can't hear, measure it.** In the browser pane, on the
+  video's page: an `AudioContext`, `createMediaElementSource(video)` into an `AnalyserNode`
+  (fftSize 8192), and every 250 ms while it plays keep the spectrum's peaks with
+  `video.currentTime` (YouTube's video is a blob: the analyser gets real data). The peaks over
+  time give the tones, their ratios and how they glide: the AVAS clip was a chord at fixed
+  ratios of a root going 334 → 398 Hz, not the single whine first guessed. Then check the
+  game's own recording against the same numbers.
+- jo's `jo_sound.volume` (0..127) is the SCSP's attenuation, ~0.8 dB a step down from 127, not a
+  share: 70 is 45 dB down, all but silent; 98 is a quarter as loud. Measure a sound's level from
+  a `record_sound` film (rms a second) before judging it missing.
+- A looped sample (`jo_audio_play_sound_loop_on_channel`) joins without a click if every tone
+  in it has a whole number of cycles in the loop; pitch it with
+  `jo_audio_set_channel_sample_rate` (one register, Hz). Give it the last channel:
+  `jo_audio_play_sound` takes the first free one.
+- jo's mono `pan` (-128..127) becomes the SCSP's level for the other side, `pan >> 3` steps of
+  3 dB down: 80 is -30 dB, one ear only; 24 is -9 dB.
 - To hear what the game plays without speakers: an E2E steps file with a `record_sound` line
   records `/out/sound.wav` (Mednafen `-soundrecord`, SDL's dummy audio). The WAV header's sizes
   are left 0 when Mednafen is killed: read the data from byte 44 (stereo, 16-bit, 48 kHz).
@@ -412,6 +585,30 @@ CLAUDE.md sit in the jo-engine checkout around it.
   wedges and spikes. Cut what's drawn to a box round what's on screen. Trail walls with no
   thickness are edge-on (hairlines) when the camera looks along them: text written with
   trails needs the camera turned off the grid's axes (30 degrees worked).
+
+### Frame timing: what "late" and "60 fps" hide (found 2026-11-15)
+
+- **jo's late count is right for VDP1; the judder we blamed on it was VDP2** (we got this wrong,
+  and jo's author measured it: johannes-fetz/joengine#110, closed 2026-11-15). A frame of 1.2
+  fields followed by one of 0.5: VDP1's table for the second waits for its own VBlank, so VDP1
+  shows every image for exactly one field, and `jo_core_get_late_frame_count()` counts exactly
+  the fields that repeat an image. What did judder was VDP2: its planes, set at the frame's end,
+  showed 299 repeats and 299 skips in 600 frames, while VDP1 was smooth. jo fixed that in
+  `5b1dbac` (#111). So: a frame's FRC period over a field (`perf_frame_late`, utils/perf.c) is
+  "over budget", **not** a repeated image; judge repeats by jo's count. Our "141 late of 192" at
+  0650 counted over-budget frames. Lesson: before calling a counter wrong, measure what the
+  screen shows field by field (the author drew the frame number with VDP1 and scrolled NBG0 by
+  it, then read a Mednafen recording back).
+- **A cpu peak over 100% is not always a late frame**: `cpu` is our callbacks only (from
+  `perf_frame_start` to `perf_frame_end`). The views where you get up peak at 104% with no frame
+  late. Judge by `late`.
+- **`JO_FRAMERATE_DYNAMIC` costs VDP1 the VBlank.** With the manual change, VDP1 erases during
+  the VBlank (`TVMR.VBE`) and starts the new table at its end; in 1-cycle mode it draws through
+  it. That's ~2.4 ms of 16.7 a field. At 60 fps, views with VDP1 near full went from 60 fps to a
+  steady 30 (the CD block's hub, 25 polygons). Turn it on only to find views short of headroom.
+- jo keeps VDP2 state with the VDP1 frame it belongs to for its glows (`__jo_vdp1_frame_tag()`,
+  `__jo_vdp1_displayed_frame_changed()`, internal). The planes (`jo_background_3d_plane_*_draw`)
+  don't: they write when called. So our `VDP2_DELAY` ring is right only while frames are on time.
 
 ## SEGA's own VDP1 and VDP2 manuals: the hardware as designed
 
@@ -910,7 +1107,7 @@ Also in `Manuals/`:
   last frame it froze on a terminal-screen flash (an empty terminal and a cursor).
 - **jo_sprite_add_tga works mid-game** (into VDP1 RAM, not BSS): textures for later scenes can wait
   for a load point. `tools/make_glass.py` makes the corridor's broken glass (`GLASS0-3.TGA`).
-- **The game boots on foot in the corridor** (`BOOT_ON_FOOT 1`, src/input.c): round 5 entered,
+- **The game boots on foot in the corridor** (`BOOT_ON_FOOT 1`, src/features.h): round 5 entered,
   the corridor opened and the memory swapped (no freeze), you stood near the stairs. Corridor
   films run straight from the build: `tests\e2e\run_e2e.ps1 -Steps greybox.steps` (~50 s, with
   `wait_up` in place of `wait_boot`: the corridor's red-black isn't the arena's navy).
@@ -1084,7 +1281,7 @@ Also in `Manuals/`:
 - **Docker Desktop isn't always up:** `docker` then fails with "failed to connect to the docker
   API ... dockerDesktopLinuxEngine". Start `C:\Program Files\Docker\Docker\Docker Desktop.exe`
   and wait for `docker info` to answer (about a minute) before filming.
-- **`BOOT_AT_HUB 1`** (input.c, with `BOOT_ON_FOOT 1`) stands you on the CD block's hub, 150
+- **`BOOT_AT_HUB 1`** (features.h, with `BOOT_ON_FOOT 1`) stands you on the CD block's hub, 150
   short of the lift's pad: films `hub.steps`, `lift.steps`. Both 0 to commit.
 
 ## Other people's Saturn work: what they measured
@@ -1144,6 +1341,53 @@ measured in our game yet: docs/BACKLOG.md has the rows ("From the Tomb Raider de
 - **Compare like with like:** OpenLara's camera saw less than the retail game's, and it let
   near polygons warp instead of clipping them. Restoring both cost them their 30 fps again. A
   number from another engine carries its camera and its clipping with it.
+
+### jo's first-person shooter sample and SegaXtreme threads (read 2026-11-15)
+
+What they mean for us is docs/BACKLOG.md, "Stabilise graphics" (tasks SG-1 to SG-12). None of it
+is measured in our game yet.
+
+- **`Samples/demo - first person shooter`** (upstream jo, not in our fork until it's merged: read
+  it with `git show upstream/master:"Samples/demo - first person shooter/main.c"`):
+  - 30 fps (`JO_FRAMERATE = 2`): frame buffers swap only when VDP1 has finished.
+  - Rooms and doors are data (`jo/cell.h`): `jo_cells_prepare` finds the rooms seen through
+    portals, VDP1 clips a far room to its door's rectangle (`jo_cells_set_portal_clipping`), a
+    wall filling the screen sets a depth limit (`jo_3d_set_depth_limit`).
+  - `plan_draw` (guards.c): each person gets a near model, a far model or nothing, decided
+    before drawing from last frame's VDP1 command count, with commands kept back for the weapon
+    and HUD. Deciding while drawing, on two CPUs, made people blink.
+  - The share of work between the CPUs follows their waits (`jo_cells_balance_share`).
+  - `DEMO_BENCH`: a build that plays a view with no input and shows a green or red screen;
+    jo's `tests/run_tests.py` reads it (`tests/README.md`). Also there: glitch views (holes,
+    stray pixels, against a magenta background) and time and size budgets
+    (`tests/golden/budgets.json`).
+  - Its rooms cover the screen, so it never clears VDP1's frame. Ours can't: the floor and sky
+    are VDP2.
+- **Mimas Engine (N0rt0N85, SegaXtreme, July-August 2026: a hardware-drawn Doom):**
+  - VDP1 in 1-cycle mode (a swap every field) drops the end of its list when it runs over:
+    "overrun does not cost time, overrun costs content". Our `JO_FRAMERATE = 1` is this mode.
+    Their cure: manual change, swapping when VDP1 is done.
+  - **CEF (EDSR bit 1) isn't a safe "finished" test on a console**: read as set on 30-60% of
+    frames in one run, never in another. They gate on the command address register (COPR).
+    Our gauge (`game/vdp1_gauge.h`) uses CEF, BEF and LOPR: check it on the Saturn.
+  - Their emulator (Ymir) never overran, so every verdict formed on it was void.
+  - Give VDP1 only what it finished last frame; rank what's dropped by distance, not by size on
+    screen (size pulses with animation, so the flicker hopped between two enemies).
+  - Sky showing under the horizon for a frame: two descriptions of the same boundary written at
+    different moments. Write both when the picture is presented.
+  - Comparing fps between two builds was noise for them: they toggle each change live.
+  - Two errata in the developer CD's VDP1 manual (ST-013 p.38-39; the Kronos team's corrected
+    scans are right): "one FRAME" should read "one FIELD"; erase is VBE and FCT 0 with FCM 1.
+    VBE is in TVMR (bit 3), not FBCR.
+- **XL2 and Ponut (Sonic Z-Treme, HELLSLAVE):**
+  - Pixels written matter more than quads; a distorted quad can nearly double them; textures
+    cost far more than flat colour. About 750-1000 textured quads at 30 fps.
+  - A polygon across the near plane or the screen's edge can take the frame to 15 fps: VDP1's
+    pre-clipping only skips whole lines. Turning the quad so its first corner is on screen
+    cured it. Pre-clipping off for quads wholly on screen is a small gain (jo does this).
+  - The near plane's distance matters a lot: "too close and you can really destroy the
+    frame-rate".
+  - XL2 moved from a BSP to portals to make bigger maps quicker to build.
 
 ## Reference projects in this repo
 
