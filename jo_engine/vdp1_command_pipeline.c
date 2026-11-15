@@ -48,6 +48,7 @@
 #include "jo/profile.h"
 #include "internal/core.h"
 #include "internal/vdp1_command_pipeline.h"
+#include "internal/sprites.h"
 #include "internal/profile.h"
 
 /*
@@ -113,9 +114,12 @@ typedef unsigned int                        __attribute__((may_alias)) jo_vdp1_w
  *  frame to draw it, the slave CPU never waits to copy the next one. Before: a table sent before the second VBLANK of
  *  its frame (the CPUs under 16.7 ms) was taken at that VBLANK, the next one sent after it (17 ms) at the VBLANK after:
  *  the image before stayed 3 fields, the one after 1 field (a stutter at each crossing of 16.7 ms: 37 in a 1200 frames
- *  run of the first person shooter with the VDP1 at 9 ms, 0 after). When the VDP1 is over a frame, its table is taken at
- *  the first VBLANK after (one image of 3 fields), the images go on from there, and come back to the VBLANKs that start
- *  the frames as soon as the VDP1 draws a frame in a field (one image of 1 field) */
+ *  run of the first person shooter with the VDP1 at 9 ms, 0 after). Each image stays JO_FRAMERATE fields at least (see
+ *  __jo_vdp1_vblank()): a table that missed its VBLANK (the CPUs, the sort and the copy over a frame, or the VDP1 over
+ *  a frame) is taken at the first VBLANK after (one image of 3 fields), and the images go on from there, JO_FRAMERATE
+ *  fields apart. Before: the next table, ready at the VBLANK that starts its frame with the VDP1 done in a field, was
+ *  taken at that VBLANK (one image of 1 field): with the CPUs near 33 ms and the VDP1 near 16.7 ms the images went 3, 1,
+ *  3, 1 fields (a judder: 92 images of 1 field in 10 s of the ocean demo, 0 after) */
 # define JO_VDP1_PACED                      (1)
 #endif
 /** @brief PMOD of the clear polygon: replace, no end code and no transparent pixel check, no pre-clipping (it is the
@@ -125,6 +129,18 @@ typedef unsigned int                        __attribute__((may_alias)) jo_vdp1_w
 # define JO_VDP1_PTMR_AUTOMATIC_DRAW        (0x0002)
 /** @brief EDSR: the drawing of the current frame is finished */
 # define JO_VDP1_EDSR_CURRENT_END           (0x0002)
+/** @brief TVMR: the displayed frame buffer is erased during the VBLANK (VBE), see jo_vdp1_vblank_erase() */
+# define JO_VDP1_TVMR_VBLANK_ERASE          (0x0008)
+/** @brief CMDCTRL: the command is skipped (jump mode: skip, next) */
+# define JO_VDP1_CMD_SKIP_NEXT              (0x4000)
+/** @brief The VBLANK erase (manual change): the lines kept out of the measure (see jo_vdp1_measure_vblank_erase()), the
+ *  fields to wait after a change of the screen mode before the measure (the VDP2 takes the new mode at a VBLANK) */
+# define JO_VDP1_VBLANK_ERASE_MARGIN        (2)
+# define JO_VDP1_VBLANK_ERASE_DELAY         (3)
+/** @brief The top of the clear polygon when the VBLANK erase cleared the whole frame buffer: the polygon is skipped */
+# define JO_VDP1_CLEAR_SKIPPED              (-32768)
+/** @brief VDP2 TVSTAT: horizontal blanking */
+# define JO_VDP2_TVSTAT_HBLANK              (1 << 2)
 /** @brief EWRR: erase/write area (right in 8 or 16 pixels unit, excluded: the width / unit; bottom line, included) */
 # define JO_VDP1_ERASE_AREA(X_UNIT, BOTTOM)       (((__jo_screen.width / (X_UNIT)) << 9) | ((BOTTOM) - 1))
 /** @brief Default Z limit of a window (no limit) */
@@ -189,7 +205,7 @@ typedef struct
 {
     jo_vdp1_command                     commands[JO_VDP1_MAX_COMMANDS] __attribute__((aligned(4)));
     unsigned short                      keys[JO_VDP1_MAX_COMMANDS];
-    unsigned short                      window[JO_VDP1_MAX_COMMANDS];
+    unsigned short                      window[JO_VDP1_MAX_COMMANDS] __attribute__((aligned(4)));   // (read 2 by 2)
     unsigned int                        count;
     jo_vdp1_window                      windows[JO_VDP1_WINDOW_COUNT]; // The windows at the end of the frame
     short                               system_clip_right;      // The system clipping at the end of the frame
@@ -217,6 +233,10 @@ bool                                    __jo_vdp1_wireframe = false;
 unsigned int                            __jo_vdp1_test_vblanks[5];
 /** @brief Test (JO_TEST_VDP1_VBLANKS): what the last VBLANK found (the index in __jo_vdp1_test_vblanks) */
 int                                     __jo_vdp1_test_last_state = 0;
+/** @brief Test (JO_TEST_VDP1_VBLANKS): the lines erased by the last measure of the VBLANK erase, the changes of the
+ *  frame buffers with the VBLANK erase (see jo_vdp1_vblank_erase()) */
+unsigned int                            __jo_vdp1_test_erase_lines = 0;
+unsigned int                            __jo_vdp1_test_vblank_erases = 0;
 #endif
 
 /** @brief The frame buffer is cleared at the start of each frame (see jo_3d_set_frame_clear()) */
@@ -290,6 +310,23 @@ static volatile unsigned int            __jo_vdp1_shown_tag;
 static volatile unsigned int            __jo_vdp1_shown_field;
 static volatile unsigned int            __jo_vdp1_next_shown_tag;
 static volatile unsigned int            __jo_vdp1_next_shown_field;
+/* The VBLANK erase (manual change mode, see jo_vdp1_vblank_erase()): the lines of the frame buffer it clears (measured
+** by jo_vdp1_measure_vblank_erase(), 0: not used), the measure to do (at the end of the frame, after the field
+** __jo_vdp1_erase_measure_field), the clear polygon of the pending table (VRAM offset, 0: none), its top under the
+** lines erased in the VBLANK (local coordinates, JO_VDP1_CLEAR_SKIPPED: none left) and its top on the whole screen, the
+** clear polygon of the table taken when it was changed (to restore before a redraw), the VBE bit set during this VBLANK
+** (JO_VDP1_SHARED) */
+static volatile unsigned int            __jo_vdp1_erase_lines;
+static bool                             __jo_vdp1_erase_measure = false;
+static unsigned int                     __jo_vdp1_erase_measure_field;
+static volatile unsigned int            __jo_vdp1_pending_clear;
+static volatile short                   __jo_vdp1_pending_clear_top;
+static volatile short                   __jo_vdp1_pending_clear_full;
+static volatile unsigned int            __jo_vdp1_taken_clear;
+static volatile short                   __jo_vdp1_taken_clear_full;
+static volatile bool                    __jo_vdp1_vblank_erase_on;
+/* Manual change: the VDP1 draws a table given at a VBLANK (see __jo_vdp1_vblank()) */
+static bool                             __jo_vdp1_drawing = false;
 #ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
 /* Frames given to the slave CPU (master CPU only), frames copied into the VRAM by the slave CPU (JO_VDP1_SHARED) */
 static unsigned int                     __jo_vdp1_frames_sent;
@@ -316,15 +353,120 @@ static void                             jo_vdp1_write_jump(const unsigned int ta
     head->ctrl = JO_VDP1_CMD_SKIP_ASSIGN;
 }
 
+/** @brief TVMR of the screen mode (without the VBLANK erase) */
+# define JO_VDP1_TVMR_MODE                  (JO_VDP1_HIRES ? JO_VDP1_TVMR_HIRES : 0)
+
 /** @brief The frame buffer registers of the screen mode: 16 bits per pixel (8 bits in hi-res), 1 cycle or manual change
  *  mode, double density interlace, erase area */
 static void                             __jo_vdp1_set_registers(void)
 {
-    JO_VDP1_TVMR = JO_VDP1_HIRES ? JO_VDP1_TVMR_HIRES : 0;
+    JO_VDP1_TVMR = JO_VDP1_TVMR_MODE;
     JO_VDP1_FBCR = JO_VDP1_INTERLACE ? JO_VDP1_FBCR_DOUBLE_INTERLACE : (JO_VDP1_MANUAL_CHANGE ? JO_VDP1_FBCR_MANUAL : 0);
     JO_VDP1_EWDR = 0;
     JO_VDP1_EWLR = 0;
     JO_VDP1_EWRR = JO_VDP1_HIRES ? JO_VDP1_ERASE_AREA(16, JO_VDP1_LINES) : JO_VDP1_ERASE_AREA(8, JO_VDP1_LINES);
+    // The VBLANK erase is measured again for this mode (the lines of the VBLANK, the width)
+    JO_VDP1_SHARED(__jo_vdp1_erase_lines) = 0;
+    __jo_vdp1_erase_measure = JO_VDP1_MANUAL_CHANGE;
+    __jo_vdp1_erase_measure_field = JO_VDP1_SHARED(__jo_vdp1_vblank_fields);
+}
+
+/** @brief Reads of the V counter before a line is given up (see jo_vdp1_wait_line(): about 6 fields) */
+# define JO_VDP1_WAIT_LINE_READS            (100000)
+
+/** @brief Wait for the start of a line (the V counter, latched by a read of EXTEN: not with a light gun, see
+ *  jo_vdp1_measure_vblank_erase())
+ *  @param line Line (0: the first line displayed, JO_VDP1_LINES: the first line of the VBLANK)
+ *  @return false if the V counter never showed the line (a mode where it counts differently: no VBLANK erase)
+ */
+static bool                             jo_vdp1_wait_line(const unsigned int line)
+{
+    unsigned int                        reads;
+
+    for (JO_ZERO(reads); reads < JO_VDP1_WAIT_LINE_READS; ++reads)
+    {
+        (void)JO_VDP2_EXTEN;
+        if (JO_VDP2_VCNT != line)
+            break;
+    }
+    for (; reads < JO_VDP1_WAIT_LINE_READS; ++reads)
+    {
+        (void)JO_VDP2_EXTEN;
+        if (JO_VDP2_VCNT == line)
+            return (true);
+    }
+    return (false);
+}
+
+/** @brief Measure the lines of the frame buffer that the VBLANK erase clears (manual change mode, see
+ *  jo_vdp1_vblank_erase()): the erase is stopped at the end of the VBLANK (Sega: "erase the unerased part with
+ *  polygons"), how far it goes depends on the lines of the VBLANK (NTSC or PAL, 224 or 240 lines), the width and the
+ *  console. A mark at the end of each line of a frame buffer, displayed for a field, erased in the VBLANK: the lines
+ *  without their mark are the lines erased
+ *  @remarks About 4 fields, the interrupts masked (the VBE bit and the change must be written in the first line of the
+ *  VBLANK). At the end of the first frame and of the first frame after a change of the screen mode: a field of the screen
+ *  shows the frame buffer of the measure (black)
+ */
+static void                             jo_vdp1_measure_vblank_erase(void)
+{
+    volatile unsigned short             *fb;
+    unsigned int                        sr;
+    unsigned int                        line;
+    unsigned int                        erased;
+    unsigned int                        last;
+    unsigned int                        field;
+
+    __jo_vdp1_erase_measure = false;
+    JO_VDP1_SHARED(__jo_vdp1_erase_lines) = 0;
+    // (the V counter is latched by the light gun, not by the reads of EXTEN: the clear polygon only)
+    if (!JO_VDP1_MANUAL_CHANGE || (JO_VDP2_EXTEN & JO_VDP2_EXTEN_EXLTEN) != 0)
+        return;
+    fb = (volatile unsigned short *)JO_VDP1_FB;
+    // The last word of an erased line (16 bits per pixel; 8 bits in hi-res: 2 pixels per word)
+    last = JO_VDP1_HIRES ? (unsigned int)__jo_screen.width / 2 - 1 : (unsigned int)__jo_screen.width - 1;
+    JO_ZERO(erased);
+    sr = __jo_core_disable_interrupts();
+    // The table being drawn finishes (else the change at the VBLANK would stop it)
+    for (field = 0; __jo_vdp1_drawing && field < 4 && (JO_VDP1_EDSR & JO_VDP1_EDSR_CURRENT_END) == 0; ++field)
+        if (!jo_vdp1_wait_line(JO_VDP1_LINES))
+            break;
+    // No drawing at the changes of the frame buffers
+    JO_VDP1_PTMR = 0;
+    if (jo_vdp1_wait_line(JO_VDP1_LINES))
+    {
+        JO_VDP1_FBCR = JO_VDP1_FBCR_MANUAL_CHANGE;
+        // (the frame buffer can't be accessed during the first line displayed)
+        if (jo_vdp1_wait_line(2))
+        {
+            for (line = 0; line < (unsigned int)JO_VDP1_LINES; ++line)
+                fb[line * 512 + last] = 0x8000;
+            // The marks displayed for a field, erased in the VBLANK after it (VBE and the change: in the first line
+            // of the VBLANK, VBE cleared after the VBLANK)
+            if (jo_vdp1_wait_line(JO_VDP1_LINES))
+            {
+                JO_VDP1_FBCR = JO_VDP1_FBCR_MANUAL_CHANGE;
+                if (jo_vdp1_wait_line(JO_VDP1_LINES))
+                {
+                    JO_VDP1_TVMR = JO_VDP1_TVMR_MODE | JO_VDP1_TVMR_VBLANK_ERASE;
+                    JO_VDP1_FBCR = JO_VDP1_FBCR_MANUAL_CHANGE;
+                    if (jo_vdp1_wait_line(2))
+                        for (; erased < (unsigned int)JO_VDP1_LINES && fb[erased * 512 + last] == 0; ++erased)
+                            ;
+                    JO_VDP1_TVMR = JO_VDP1_TVMR_MODE;
+                }
+            }
+            for (line = 0; line < (unsigned int)JO_VDP1_LINES; ++line)
+                fb[line * 512 + last] = 0;
+        }
+    }
+    JO_VDP1_PTMR = JO_VDP1_PTMR_AUTOMATIC_DRAW;
+    // (the next table is taken at the next VBLANK: no drawing in progress)
+    __jo_vdp1_drawing = false;
+    __jo_core_restore_interrupts(sr);
+    JO_VDP1_SHARED(__jo_vdp1_erase_lines) = erased > JO_VDP1_VBLANK_ERASE_MARGIN ? erased - JO_VDP1_VBLANK_ERASE_MARGIN : 0;
+#ifdef JO_TEST_VDP1_VBLANKS
+    __jo_vdp1_test_erase_lines = erased;
+#endif
 }
 
 void                                    __jo_vdp1_init(void)
@@ -746,9 +888,11 @@ static unsigned short                   *jo_vdp1_radix_sort(const jo_vdp1_frame 
  *  hundreds per frame)
  *  @param frame Frame
  *  @param order The sorted commands (see jo_vdp1_radix_sort())
+ *  @param windows Output: the windows of the commands (one run of commands each, one header)
  *  @return The grouped commands (__jo_vdp1_sort_a: the sort does not use it any more)
  */
-static unsigned short                   *jo_vdp1_group_windows(const jo_vdp1_frame * const frame, const unsigned short * const order)
+static unsigned short                   *jo_vdp1_group_windows(const jo_vdp1_frame * const frame, const unsigned short * const order,
+                                                               unsigned int * const windows)
 {
     unsigned int                        first[JO_VDP1_HEADER_SLOTS];
     unsigned int                        sum;
@@ -760,9 +904,12 @@ static unsigned short                   *jo_vdp1_group_windows(const jo_vdp1_fra
         JO_ZERO(first[i]);
     for (JO_ZERO(i); i < n; ++i)
         ++first[frame->window[i]];
+    JO_ZERO(*windows);
     for (JO_ZERO(i), JO_ZERO(sum); i < JO_VDP1_HEADER_SLOTS; ++i)
     {
         n = first[i];
+        if (n != 0)
+            ++*windows;
         first[i] = sum;
         sum += n;
     }
@@ -951,21 +1098,50 @@ static  __jo_force_inline bool          jo_vdp1_dma_busy(void)
     return ((JO_SCU_DMA_STATUS & JO_SCU_DMA_STATUS_BUSY(JO_VDP1_SCU_DMA_LEVEL)) != 0);
 }
 
+/** @brief Check if all the commands of a frame are in the same window
+ *  @param frame Frame (at least one command)
+ *  @remarks In the order of the array, 2 windows a read (the array starts on 4 bytes, see jo_vdp1_frame)
+ */
+static bool                             jo_vdp1_one_window(const jo_vdp1_frame * const frame)
+{
+    const jo_vdp1_word                  *w;
+    const jo_vdp1_word                  *end;
+    unsigned int                        pair;
+
+    // (the first window in both halves of a word)
+    pair = (unsigned int)frame->window[0] * 0x10001u;
+    w = (const jo_vdp1_word *)frame->window;
+    end = w + JO_DIV_BY_2(frame->count);
+    for (; w < end; ++w)
+        if (*w != pair)
+            return (false);
+    // (an odd count: the last one alone)
+    return ((frame->count & 1) == 0 || frame->window[frame->count - 1] == frame->window[0]);
+}
+
 /** @brief The first command that fits in the table with the headers of its window changes (the commands sorted far to
  *  near: the farthest ones are dropped first)
  *  @param frame Frame (the windows of its commands)
  *  @param order Command indexes in the order of the sort
  *  @param n Number of commands (at least one)
  *  @param room Commands the table can take
+ *  @param windows The commands grouped by window: the windows (see jo_vdp1_group_windows()), 0: not grouped
  *  @return Index in order of the first command to draw (0: all)
  */
 static unsigned int                     jo_vdp1_first_fitting(const jo_vdp1_frame * const frame, const unsigned short * const order,
-                                                              unsigned int n, const unsigned int room)
+                                                              unsigned int n, const unsigned int room, const unsigned int windows)
 {
     unsigned int                        cost;
     unsigned short                      window;
     unsigned short                      previous;
 
+    // The usual frames: all the commands in one window, or grouped by window (a split screen), one header per window: they
+    // all fit when the table takes them and the headers (the walk below reads the windows in the order of the sort, at
+    // random, about 16 cycles a command: 0.6 ms of the CPU in a frame of 600 to 1000 commands; the check of one window,
+    // in the order of the array, about 2, Mednafen)
+    if (windows != 0 ? n + JO_VDP1_HEADER_COMMANDS * windows <= room :
+                       n + JO_VDP1_HEADER_COMMANDS <= room && jo_vdp1_one_window(frame))
+        return (0);
     // From the nearest: each command, and the header of each run of commands of a window
     previous = frame->window[order[n - 1]];
     cost = JO_VDP1_HEADER_COMMANDS + 1;
@@ -996,6 +1172,7 @@ static void                             jo_vdp1_send_frame(void *argument)
     unsigned int                        limit;
     unsigned int                        entries;
     unsigned int                        *dma;
+    unsigned int                        windows;
     register unsigned int               i;
     register unsigned int               j;
     int                                 window;
@@ -1004,8 +1181,15 @@ static void                             jo_vdp1_send_frame(void *argument)
     unsigned short                      skip_key;
     bool                                skip;
     unsigned short                      *order;
+    unsigned int                        clear;
+    int                                 erased;
+    short                               clear_top;
+    short                               clear_full;
 
     frame = (const jo_vdp1_frame *)argument;
+    JO_ZERO(clear);
+    JO_ZERO(clear_top);
+    JO_ZERO(clear_full);
     // (the commands of the slave CPU may still be copied by the DMA, see jo_3d_slave_copy_job())
     if (frame->wireframe)
     {
@@ -1021,8 +1205,9 @@ static void                             jo_vdp1_send_frame(void *argument)
             if (frame->window[j] == frame->window_change_window[i])
                 ((jo_vdp1_frame *)frame)->window[j] = (unsigned short)(JO_VDP1_WINDOW_COUNT + i);
     order = jo_vdp1_radix_sort(frame);
+    JO_ZERO(windows);
     if (frame->windows_apart)
-        order = jo_vdp1_group_windows(frame, order);
+        order = jo_vdp1_group_windows(frame, order, &windows);
     jo_profile_end(JO_PROFILE_VDP1_SORT);
     jo_profile_count(JO_PROFILE_VDP1_COMMANDS, n);
     jo_profile_begin(JO_PROFILE_VDP1_WAIT);
@@ -1067,6 +1252,12 @@ static void                             jo_vdp1_send_frame(void *argument)
         jo_vdp1_dma_add(dma, &entries, &__jo_vdp1_dma_commands[0], offset, JO_VDP1_HEADER_COMMANDS * sizeof(jo_vdp1_command));
         offset += JO_VDP1_HEADER_COMMANDS * sizeof(jo_vdp1_command);
         current_window = 0;
+        // (when the VBLANK erase clears the frame buffer, see jo_vdp1_vblank_erase(): the polygon only covers the lines
+        // under the lines erased, or it is skipped)
+        clear = offset;
+        erased = (int)JO_VDP1_SHARED(__jo_vdp1_erase_lines);
+        clear_full = __jo_vdp1_dma_commands[JO_VDP1_DMA_CLEAR_COMMAND].ya;
+        clear_top = erased > frame->system_clip_bottom ? JO_VDP1_CLEAR_SKIPPED : (short)(clear_full + erased);
         jo_vdp1_dma_add(dma, &entries, &__jo_vdp1_dma_commands[JO_VDP1_DMA_CLEAR_COMMAND], offset, sizeof(jo_vdp1_command));
         offset += sizeof(jo_vdp1_command);
     }
@@ -1076,7 +1267,7 @@ static void                             jo_vdp1_send_frame(void *argument)
     // be the ones dropped. The farthest ones are dropped instead (counted only when the frame could overflow)
     if (n > 0 && n * (JO_VDP1_HEADER_COMMANDS + 1) > (limit - offset) / sizeof(jo_vdp1_command))
     {
-        j = jo_vdp1_first_fitting(frame, order, n, (limit - offset) / sizeof(jo_vdp1_command));
+        j = jo_vdp1_first_fitting(frame, order, n, (limit - offset) / sizeof(jo_vdp1_command), windows);
         order += j;
         n -= j;
     }
@@ -1170,6 +1361,9 @@ static void                             jo_vdp1_send_frame(void *argument)
     JO_VDP1_SHARED(__jo_vdp1_next_table) = (table == JO_VDP1_TABLE_A_OFFSET) ? JO_VDP1_TABLE_B_OFFSET : JO_VDP1_TABLE_A_OFFSET;
     jo_profile_end(JO_PROFILE_VDP1_COPY);
     // Displayed at the first VBLANK after the end of the copy (see __jo_vdp1_vblank())
+    JO_VDP1_SHARED(__jo_vdp1_pending_clear) = clear;
+    JO_VDP1_SHARED(__jo_vdp1_pending_clear_top) = clear_top;
+    JO_VDP1_SHARED(__jo_vdp1_pending_clear_full) = clear_full;
     JO_VDP1_SHARED(__jo_vdp1_pending_tag) = frame->tag;
     JO_VDP1_SHARED(__jo_vdp1_pending_table) = table;
 #ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
@@ -1188,6 +1382,19 @@ void                                    __jo_vdp1_end_frame(void)
     jo_vdp1_frame                       *frame;
     int                                 i;
 
+    // The VBLANK erase measured for the screen mode (first frame, change of the mode), when the frame before is in the
+    // VDP1 (see jo_vdp1_measure_vblank_erase())
+    if (__jo_vdp1_erase_measure &&
+        JO_VDP1_SHARED(__jo_vdp1_vblank_fields) - __jo_vdp1_erase_measure_field >= JO_VDP1_VBLANK_ERASE_DELAY)
+    {
+#ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
+        while (__jo_vdp1_frames_sent != JO_VDP1_SHARED(__jo_vdp1_frames_done))
+            ;
+#endif
+        while (JO_VDP1_SHARED(__jo_vdp1_pending_table) || jo_vdp1_dma_busy())
+            ;
+        jo_vdp1_measure_vblank_erase();
+    }
     frame = __jo_vdp1_frame;
     frame->tag = __jo_vdp1_building_tag++;
     // A sprite may still be copied in VRAM by the DMA controller (see __jo_sprite_replace())
@@ -1250,14 +1457,77 @@ void                                    __jo_vdp1_end_frame(void)
 
 void                                    jo_vdp1_redraw_last_frame(void)
 {
+    volatile jo_vdp1_command            *clear;
+
     // (manual change: the VDP1 draws only when the frame buffers change; 1 cycle mode: at each field already)
     if (JO_VDP1_MANUAL_CHANGE && (JO_VDP1_EDSR & JO_VDP1_EDSR_CURRENT_END) != 0)
+    {
+        // No VBLANK erase for this change: the clear polygon of the table covers the whole screen again
+        if (JO_VDP1_SHARED(__jo_vdp1_taken_clear))
+        {
+            clear = JO_VDP1_COMMAND_AT(JO_VDP1_SHARED(__jo_vdp1_taken_clear));
+            clear->ctrl = JO_VDP1_CMD_POLYGON;
+            clear->ya = JO_VDP1_SHARED(__jo_vdp1_taken_clear_full);
+            clear->yb = JO_VDP1_SHARED(__jo_vdp1_taken_clear_full);
+            JO_ZERO(JO_VDP1_SHARED(__jo_vdp1_taken_clear));
+        }
         JO_VDP1_FBCR = JO_VDP1_FBCR_MANUAL_CHANGE;
+    }
+}
+
+/** @brief The VBLANK erase (manual change mode, called by __jo_vdp1_vblank() when it changes the frame buffers): the
+ *  displayed frame buffer is erased during the VBLANK and becomes the frame buffer drawn at the end of the VBLANK. The
+ *  clear polygon of the table (about 4 ms of VDP1 time in 320 x 224) only covers the lines that the VBLANK is too short
+ *  to erase (measured, see jo_vdp1_measure_vblank_erase()), or it is skipped (one VRAM write). The erase of the manual
+ *  erase mode (FBCR FCM = 1, FCT = 0) would need to know a field before the change that the VDP1 finishes its drawing
+ *  during that field (a frame buffer erased without a change: a field without the VDP1 image)
+ *  @remarks Sega: VBE is set "immediately after the V blank IN interrupt" and taken into account after one line, it is
+ *  cleared after the VBLANK-OUT interrupt (else the next VBLANK erases too, see __jo_vdp1_vblank_out()). When the
+ *  write came too late (the V counter after the first line of the VBLANK; with a light gun, unknown) the clear polygon
+ *  covers the whole screen as before: the result is right with or without the erase
+ */
+static void                             jo_vdp1_vblank_erase(void)
+{
+    const unsigned int                  clear = JO_VDP1_SHARED(__jo_vdp1_pending_clear);
+    const short                         top = JO_VDP1_SHARED(__jo_vdp1_pending_clear_top);
+    const short                         full = JO_VDP1_SHARED(__jo_vdp1_pending_clear_full);
+    volatile jo_vdp1_command            *cmd;
+
+    JO_ZERO(JO_VDP1_SHARED(__jo_vdp1_taken_clear));
+    if (!clear || top == full)
+        return;
+    JO_VDP1_TVMR = JO_VDP1_TVMR_MODE | JO_VDP1_TVMR_VBLANK_ERASE;
+    JO_VDP1_SHARED(__jo_vdp1_vblank_erase_on) = true;
+    // (reading EXTEN latches the counters, not with a light gun; still in the first line of the VBLANK, before its
+    // HBLANK: the VDP1 takes VBE at the end of that line)
+    if ((JO_VDP2_EXTEN & JO_VDP2_EXTEN_EXLTEN) != 0 || JO_VDP2_VCNT != (unsigned short)JO_VDP1_LINES ||
+        (JO_VDP2_TVSTAT & JO_VDP2_TVSTAT_HBLANK) != 0)
+        return;
+    cmd = JO_VDP1_COMMAND_AT(clear);
+    if (top == JO_VDP1_CLEAR_SKIPPED)
+        cmd->ctrl = JO_VDP1_CMD_POLYGON | JO_VDP1_CMD_SKIP_NEXT;
+    else
+    {
+        cmd->ya = top;
+        cmd->yb = top;
+    }
+    JO_VDP1_SHARED(__jo_vdp1_taken_clear) = clear;
+    JO_VDP1_SHARED(__jo_vdp1_taken_clear_full) = full;
+#ifdef JO_TEST_VDP1_VBLANKS
+    ++__jo_vdp1_test_vblank_erases;
+#endif
+}
+
+void                                    __jo_vdp1_vblank_out(void)
+{
+    if (!JO_VDP1_SHARED(__jo_vdp1_vblank_erase_on))
+        return;
+    JO_VDP1_TVMR = JO_VDP1_TVMR_MODE;
+    JO_VDP1_SHARED(__jo_vdp1_vblank_erase_on) = false;
 }
 
 void                                    __jo_vdp1_vblank(void)
 {
-    static bool                         drawing = false;
     unsigned int                        table;
 
     JO_VDP1_SHARED(__jo_vdp1_vblank_fields) = JO_VDP1_SHARED(__jo_vdp1_vblank_fields) + 1;
@@ -1277,7 +1547,7 @@ void                                    __jo_vdp1_vblank(void)
         __jo_vdp1_test_last_state = (JO_VDP1_EDSR & JO_VDP1_EDSR_CURRENT_END) == 0 ? 0 : 1;
     else if (jo_vdp1_dma_busy())
         __jo_vdp1_test_last_state = 2;
-    else if (JO_VDP1_MANUAL_CHANGE && drawing && (JO_VDP1_EDSR & JO_VDP1_EDSR_CURRENT_END) == 0)
+    else if (JO_VDP1_MANUAL_CHANGE && __jo_vdp1_drawing && (JO_VDP1_EDSR & JO_VDP1_EDSR_CURRENT_END) == 0)
         __jo_vdp1_test_last_state = 3;
     else
         __jo_vdp1_test_last_state = 4;
@@ -1287,19 +1557,27 @@ void                                    __jo_vdp1_vblank(void)
         return;
     if (JO_VDP1_MANUAL_CHANGE)
     {
-        // Manual change: the new table is drawn when the VDP1 finished the current one (else the next VBLANK)
-        if (drawing && (JO_VDP1_EDSR & JO_VDP1_EDSR_CURRENT_END) == 0)
+#if JO_VDP1_PACED && JO_FRAMERATE > 1
+        // The pace of the images (see JO_VDP1_PACED): the image shown stays JO_FRAMERATE fields at least
+        if (__jo_vdp1_drawing &&
+            JO_VDP1_SHARED(__jo_vdp1_vblank_fields) - JO_VDP1_SHARED(__jo_vdp1_flip_field) < (unsigned int)JO_FRAMERATE)
             return;
+#endif
+        // Manual change: the new table is drawn when the VDP1 finished the current one (else the next VBLANK)
+        if (__jo_vdp1_drawing && (JO_VDP1_EDSR & JO_VDP1_EDSR_CURRENT_END) == 0)
+            return;
+        // (first: VBE in the first line of the VBLANK)
+        jo_vdp1_vblank_erase();
         jo_vdp1_write_jump(table);
         // The frame buffers change at the end of this VBLANK, then the VDP1 draws the new table: the image of the
         // previous table is displayed from this field
         JO_VDP1_FBCR = JO_VDP1_FBCR_MANUAL_CHANGE;
-        if (drawing)
+        if (__jo_vdp1_drawing)
         {
             JO_VDP1_SHARED(__jo_vdp1_shown_tag) = JO_VDP1_SHARED(__jo_vdp1_taken_tag);
             JO_VDP1_SHARED(__jo_vdp1_shown_field) = JO_VDP1_SHARED(__jo_vdp1_vblank_fields);
         }
-        drawing = true;
+        __jo_vdp1_drawing = true;
     }
     else
     {
@@ -1520,8 +1798,9 @@ static  __jo_force_inline jo_fixed      jo_vdp1_perspective_scale(const jo_fixed
  *  @return false if the command table is full
  *  @remarks The sprite covers (width * scale) x (height * scale) pixels (VDP1 coordinates are inclusive)
  *  @remarks A sprite without scale and rotation is drawn with a normal sprite command (faster and pixel perfect)
+ *  @remarks Not inlined: one copy for all the sprites (about 0.7 KB of code)
  */
-static bool                             jo_vdp1_draw_sprite(const jo_fixed cx, const jo_fixed cy, const jo_fixed z, jo_fixed sx, jo_fixed sy,
+static __attribute__((noinline)) bool   jo_vdp1_draw_sprite(const jo_fixed cx, const jo_fixed cy, const jo_fixed z, jo_fixed sx, jo_fixed sy,
                                                             const jo_angle angle, const jo_vdp1_sprite_attribute *attr)
 {
     jo_vdp1_command                     *cmd;
@@ -1538,9 +1817,6 @@ static bool                             jo_vdp1_draw_sprite(const jo_fixed cx, c
     unsigned int                        last;
     unsigned short                      mode;
 
-    if ((cmd = jo_vdp1_new_command(z)) == JO_NULL)
-        return (false);
-    words = JO_VDP1_COMMAND_WORDS(cmd);
     texture = &__jo_sprite_def[attr->texture_id];
     // (a negative scale is rare: out of the common path)
     if (__builtin_expect(sx < 0, 0))
@@ -1559,7 +1835,13 @@ static bool                             jo_vdp1_draw_sprite(const jo_fixed cx, c
     {
         w = JO_FIXED_TO_INT(jo_fixed_mult(JO_INT_TO_FIXED(texture->width), sx) + JO_FIXED_1_DIV_2);
         h = JO_FIXED_TO_INT(jo_fixed_mult(JO_INT_TO_FIXED(texture->height), sy) + JO_FIXED_1_DIV_2);
+        // A scale that leaves no pixel: nothing drawn (the VDP1 drew the corner pixel, a dot left by a sprite shrunk to 0)
+        if (w <= 0 || h <= 0)
+            return (true);
     }
+    if ((cmd = jo_vdp1_new_command(z)) == JO_NULL)
+        return (false);
+    words = JO_VDP1_COMMAND_WORDS(cmd);
     x0 = JO_FIXED_TO_INT(cx) - JO_DIV_BY_2(w);
     y0 = JO_FIXED_TO_INT(cy) - JO_DIV_BY_2(h);
     // Last pixel (inclusive coordinates)
@@ -1593,6 +1875,61 @@ static bool                             jo_vdp1_draw_sprite(const jo_fixed cx, c
     words[5] = last;
     words[6] = JO_VDP1_PACK(x0, y0 + h);
     return (true);
+}
+
+/** @brief jo_sprite_draw3D() and jo_sprite_draw3D2(): a sprite of the current sprite attributes, without rotation, straight to
+ *  jo_vdp1_draw_sprite() (the position and the scale in registers). The same command as jo_sprite_draw_rotate(), which went
+ *  through __jo_vdp1_draw_sprite() with 2 structures written to the stack and read back: about 570 cycles a sprite there,
+ *  480 here (Mednafen; one copy of the command code: a copy of it here was 0.8 KB more for each game)
+ *  @param sprite_id Sprite Id (negative: nothing drawn)
+ *  @param x Horizontal position (pixels, see centered)
+ *  @param y Vertical position
+ *  @param z Depth
+ *  @param centered true: (x, y) is the center of the sprite from the center of the window, false: its top left corner from
+ *  the top left of the screen
+ */
+static  __jo_force_inline void          jo_vdp1_draw_sprite3D(const int sprite_id, int x, int y, const int z, const bool centered)
+{
+    jo_vdp1_sprite_attribute            attr;
+    jo_fixed                            fz;
+    jo_fixed                            sx;
+    jo_fixed                            sy;
+    jo_fixed                            ps;
+
+    // (see jo_sprite_draw_rotate(): no sprite (for instance jo_get_video_sprite() when the movie is stopped))
+    if (sprite_id < 0)
+        return;
+    fz = jo_int2fixed(z);
+    if (!jo_vdp1_is_sprite_visible(fz))
+        return;
+    if (!centered)
+    {
+        x = x - __jo_screen.width_2 + JO_DIV_BY_2(__jo_sprite_def[sprite_id].width);
+        y = y - __jo_screen.height_2 + JO_DIV_BY_2(__jo_sprite_def[sprite_id].height);
+    }
+    __jo_sprite_attributes_of_state(&attr, sprite_id, &__jo_sprite_attributes);
+    // (see __jo_vdp1_draw_sprite_hv(): the perspective scale, one division for both)
+    sx = __jo_sprite_attributes.fixed_scale_x;
+    sy = __jo_sprite_attributes.fixed_scale_y;
+    if ((sx | sy) < 0)
+    {
+        ps = jo_vdp1_perspective_scale(fz);
+        if (sx < 0)
+            sx = jo_fixed_mult(-sx, ps);
+        if (sy < 0)
+            sy = jo_fixed_mult(-sy, ps);
+    }
+    jo_vdp1_draw_sprite(jo_vdp1_window_center_x() + jo_int2fixed(x), jo_vdp1_window_center_y() + jo_int2fixed(y), fz, sx, sy, 0, &attr);
+}
+
+void __attribute__((noinline))          __jo_vdp1_draw_sprite3D(const int sprite_id, const int x, const int y, const int z)
+{
+    jo_vdp1_draw_sprite3D(sprite_id, x, y, z, true);
+}
+
+void __attribute__((noinline))          __jo_vdp1_draw_sprite3D2(const int sprite_id, const int x, const int y, const int z)
+{
+    jo_vdp1_draw_sprite3D(sprite_id, x, y, z, false);
 }
 
 bool                                    __jo_vdp1_draw_sprite(const jo_vdp1_sprite_position * const pos, const jo_vdp1_sprite_attribute * const attr, const jo_angle angle)

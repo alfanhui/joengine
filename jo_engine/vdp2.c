@@ -267,6 +267,8 @@ applied atomically between two frames.
 # define JO_VDP2_SPCTL_COLOR_CALC_MASK      (0x3700)
 /** @brief SPCTL: color calculation when the sprite priority is <= 7 (all sprites) */
 # define JO_VDP2_SPCTL_COLOR_CALC_ALL       (7 << 8)
+/** @brief SPCTL: color calculation when the MSB of the color is 1 (the RGB pixels only) */
+# define JO_VDP2_SPCTL_COLOR_CALC_MSB       (3 << 12)
 
 /** @brief SCRCTL: NBG0 line scroll bits (the bit 0, the vertical cell scroll, is set apart) */
 # define JO_VDP2_SCRCTL_NBG0_MASK           (0x003e)
@@ -738,6 +740,20 @@ static void                         jo_vdp2_update_cycle_patterns(void)
             slots[bank][first] = JO_VDP2_CYCLE_CHARACTER(n);
         if (first > used[bank])
             used[bank] = first;
+        // T0 to T3 full (4 screens in one bank, like the 2 glow layers with the map of NBG1): the characters in T4 to T7,
+        // taken from the CPU. In normal resolution the character reads of a pattern name read at Tn can be from Tn+4 to
+        // T7 (VDP2 manual, chapter 3: T0 -> T4-T7, T1 -> T5-T7, T2 -> T6-T7, T3 -> T7); in high resolution never. Without
+        // a slot the screen was not displayed at all (the second glow, NBG3, never seen in the demo rally)
+        if (i < count && !__jo_screen.hires)
+        {
+            for (first = pattern_name_slot + 4; i < count && first < 8; ++first)
+            {
+                if (slots[bank][first] != JO_VDP2_CYCLE_CPU)
+                    continue;
+                slots[bank][first] = JO_VDP2_CYCLE_CHARACTER(n);
+                ++i;
+            }
+        }
     }
     // The vertical cell scroll table of NBG1: one read in T0 to T2 of the bank of the table (the effect is enabled only
     // with this slot, in the same VBLANK)
@@ -1167,19 +1183,39 @@ static void                         jo_vdp2_make_coefficient_entries(void *addr,
 {
     volatile unsigned int           *table;
     register unsigned int           e;
+    unsigned int                    d;
+    unsigned int                    q;
+    int                             r;
 
     table = (volatile unsigned int *)(JO_VDP2_VRAM + jo_vdp2_vram_offset(addr));
-    for (e = from; e < to; ++e)
+    for (e = from; e < to && e < __jo_vdp2_ktable_first_entry; ++e)
+        table[e] = JO_VDP2_KTABLE_TRANSPARENT;
+    // The quotient K / d (K = 128 in 16.16) of a divisor from the quotient q and the remainder r of the divisor before:
+    // K = q (d - 1) + r = q d + (r - q), the quotient goes down by K / d^2 (under 3 from d = 2048) when r - q is negative.
+    // The division unit (39 cycles) for the first entry and the small divisors: the table took 43 ms
+    JO_ZERO(q);
+    JO_ZERO(r);
+    for (; e < to; ++e)
     {
-        if (e < __jo_vdp2_ktable_first_entry)
-            table[e] = JO_VDP2_KTABLE_TRANSPARENT;
-        else
+        d = e - JO_VDP2_KTABLE_ORIGIN;
+        if (d < 2048 || q == 0)
         {
             // 32 bits / 32 bits with the division unit (the values are positive)
-            JO_SH2_DVSR = e - JO_VDP2_KTABLE_ORIGIN;
+            JO_SH2_DVSR = d;
             JO_SH2_DVDNT = JO_INT_TO_FIXED(JO_VDP2_KTABLE_SCALE);
-            table[e] = ((unsigned int)JO_SH2_DVDNTL) & JO_VDP2_KTABLE_VALUE_MASK;
+            q = (unsigned int)JO_SH2_DVDNTL;
+            r = (int)(JO_INT_TO_FIXED(JO_VDP2_KTABLE_SCALE) - q * d);
         }
+        else
+        {
+            r -= (int)q;
+            while (r < 0)
+            {
+                --q;
+                r += (int)d;
+            }
+        }
+        table[e] = q & JO_VDP2_KTABLE_VALUE_MASK;
     }
 }
 
@@ -1395,7 +1431,7 @@ void                                __jo_vdp2_init_registers(void)
 
     // Display off while we initialize the video hardware
     JO_VDP2_TVMD = 0;
-    // Clear VRAM and color RAM
+    // Clear VRAM and color RAM (by the CPU: the DMA controller took 50 ms instead of 30 ms)
     for (JO_ZERO(i); i < JO_VDP2_VRAM_SIZE; i += 4)
         *(volatile unsigned int *)(JO_VDP2_VRAM + i) = 0;
     for (JO_ZERO(i); i < JO_VDP2_CRAM_SIZE; i += 4)
@@ -1467,12 +1503,16 @@ void                                __jo_vdp2_init_registers(void)
    ╚═╝   ╚══════╝╚═╝  ╚═╝   ╚═╝
 
 jo_printf() output on NBG0: 64x64 cells map, 8x8 pixels font, 16 colors cells.
+The characters: ASCII (0 to 127) and the half-width katakana of Shift-JIS (0xA1 to 0xDF, one byte each: the comments of
+the saves in the backup memory); the other bytes are blank.
 Each glyph pixel uses color 1 of the current 16 colors palette (jo_set_printf_color_index()).
 The 16 colors palettes 0 to 7 are in the first 256 colors of the color RAM, which is not used by jo_create_palette().
 */
 
 /** @brief Glyph pixel color (in the 16 colors palette) */
 # define JO_VDP2_PRINTF_GLYPH_COLOR     (1)
+/** @brief Outline pixel color (in the 16 colors palette, see jo_set_printf_outline()) */
+# define JO_VDP2_PRINTF_OUTLINE_COLOR   (2)
 
 # define JO_VDP2_PRINTF_MAP             ((volatile unsigned short *)(JO_VDP2_VRAM + JO_VDP2_PRINTF_MAP_OFFSET))
 # define JO_VDP2_PRINTF_CHARACTER_BASE  ((JO_VDP2_PRINTF_CELL_OFFSET >> 5) & JO_VDP2_CHARACTER_NUMBER_MASK)
@@ -1549,27 +1589,148 @@ static const unsigned char          __jo_vdp2_printf_font[128 * 8] =
 
 };
 
+/** @brief The color of a pixel of a printf character (0: transparent, the glyph color, the outline color)
+ *  @param c Character
+ *  @param x Column (0: left)
+ *  @param y Row (0: top)
+ *  @param outline The pixels around the glyph in the outline color (inside the 8x8 cell)
+ */
+/* 8x8 font, the half-width katakana of JIS X 0201: Shift-JIS 0xA1 to 0xDF (the comments of the saves in the backup
+   memory, see jo_backup_get_file_info()) */
+static const unsigned char          __jo_vdp2_printf_kana_font[(0xDF - 0xA1 + 1) * 8] =
+{
+    0x00, 0x00, 0x00, 0x00, 0x70, 0xD8, 0x70, 0x00, // 0xA1 ideographic full stop
+    0x7C, 0x60, 0x60, 0x60, 0x60, 0x00, 0x00, 0x00, // 0xA2 left corner bracket
+    0x00, 0x00, 0x0C, 0x0C, 0x0C, 0x0C, 0x7C, 0x00, // 0xA3 right corner bracket
+    0x00, 0x00, 0x00, 0x00, 0x60, 0x30, 0x18, 0x00, // 0xA4 ideographic comma
+    0x00, 0x00, 0x00, 0x30, 0x30, 0x00, 0x00, 0x00, // 0xA5 katakana middle dot
+    0xFC, 0x0C, 0xFC, 0x0C, 0x18, 0x30, 0x60, 0x00, // 0xA6 katakana letter wo
+    0x00, 0x00, 0xFC, 0x18, 0x38, 0x30, 0x60, 0x00, // 0xA7 katakana letter small a
+    0x00, 0x00, 0x0C, 0x18, 0x78, 0xD8, 0x18, 0x00, // 0xA8 katakana letter small i
+    0x00, 0x00, 0x30, 0xFC, 0xCC, 0x18, 0x60, 0x00, // 0xA9 katakana letter small u
+    0x00, 0x00, 0x00, 0xF8, 0x30, 0x30, 0xFC, 0x00, // 0xAA katakana letter small e
+    0x00, 0x00, 0x18, 0xFC, 0x38, 0x78, 0xD8, 0x00, // 0xAB katakana letter small o
+    0x00, 0x00, 0x60, 0xFC, 0x6C, 0x30, 0x30, 0x00, // 0xAC katakana letter small ya
+    0x00, 0x00, 0x00, 0x78, 0x18, 0x18, 0xFC, 0x00, // 0xAD katakana letter small yu
+    0x00, 0x00, 0xF8, 0x18, 0xF8, 0x18, 0xF8, 0x00, // 0xAE katakana letter small yo
+    0x00, 0x00, 0x00, 0xAC, 0xAC, 0x18, 0x70, 0x00, // 0xAF katakana letter small tu
+    0x00, 0x00, 0x00, 0xFC, 0x00, 0x00, 0x00, 0x00, // 0xB0 katakana-hiragana prolonged sound mark
+    0xFC, 0x0C, 0x38, 0x30, 0x30, 0x60, 0xC0, 0x00, // 0xB1 katakana letter a
+    0x0C, 0x18, 0x38, 0x78, 0xD8, 0x18, 0x18, 0x00, // 0xB2 katakana letter i
+    0x30, 0x30, 0xFC, 0xCC, 0x0C, 0x18, 0x60, 0x00, // 0xB3 katakana letter u
+    0x00, 0xFC, 0x30, 0x30, 0x30, 0x30, 0xFC, 0x00, // 0xB4 katakana letter e
+    0x18, 0x18, 0xFC, 0x38, 0x78, 0xD8, 0x18, 0x00, // 0xB5 katakana letter o
+    0x30, 0x30, 0xFC, 0x66, 0x66, 0x66, 0xCC, 0x00, // 0xB6 katakana letter ka
+    0x60, 0xFC, 0x60, 0xFC, 0x30, 0x30, 0x30, 0x00, // 0xB7 katakana letter ki
+    0x60, 0x7C, 0xCC, 0x0C, 0x18, 0x30, 0xC0, 0x00, // 0xB8 katakana letter ku
+    0x60, 0x7C, 0xD8, 0x98, 0x18, 0x30, 0x60, 0x00, // 0xB9 katakana letter ke
+    0x00, 0xFC, 0x0C, 0x0C, 0x0C, 0x0C, 0xFC, 0x00, // 0xBA katakana letter ko
+    0x6C, 0x6C, 0xFC, 0x6C, 0x0C, 0x18, 0x60, 0x00, // 0xBB katakana letter sa
+    0xC0, 0x20, 0xC6, 0x06, 0x0C, 0x30, 0xE0, 0x00, // 0xBC katakana letter si
+    0xFC, 0x0C, 0x0C, 0x18, 0x3C, 0x66, 0xC0, 0x00, // 0xBD katakana letter su
+    0x60, 0x60, 0xFC, 0x6C, 0x78, 0x60, 0x3C, 0x00, // 0xBE katakana letter se
+    0xC6, 0x66, 0x0C, 0x0C, 0x18, 0x30, 0xE0, 0x00, // 0xBF katakana letter so
+    0x60, 0x7C, 0xCC, 0x78, 0x18, 0x30, 0xC0, 0x00, // 0xC0 katakana letter ta
+    0x1C, 0xF0, 0x30, 0xFC, 0x30, 0x30, 0x60, 0x00, // 0xC1 katakana letter ti
+    0x00, 0xA6, 0xA6, 0x0C, 0x18, 0x30, 0xE0, 0x00, // 0xC2 katakana letter tu
+    0x78, 0x00, 0xFC, 0x30, 0x30, 0x60, 0xC0, 0x00, // 0xC3 katakana letter te
+    0x60, 0x60, 0x60, 0x78, 0x6C, 0x60, 0x60, 0x00, // 0xC4 katakana letter to
+    0x30, 0x30, 0xFC, 0x30, 0x30, 0x60, 0xC0, 0x00, // 0xC5 katakana letter na
+    0x00, 0x78, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x00, // 0xC6 katakana letter ni
+    0xFC, 0x0C, 0x38, 0x18, 0x78, 0xCC, 0x00, 0x00, // 0xC7 katakana letter nu
+    0x30, 0xFC, 0x18, 0x38, 0x7C, 0xD8, 0x18, 0x00, // 0xC8 katakana letter ne
+    0x0C, 0x0C, 0x18, 0x18, 0x30, 0x60, 0xC0, 0x00, // 0xC9 katakana letter no
+    0x00, 0x28, 0x6C, 0x66, 0xC6, 0x86, 0x00, 0x00, // 0xCA katakana letter ha
+    0xC0, 0xCC, 0xF0, 0xC0, 0xC0, 0xC0, 0x7C, 0x00, // 0xCB katakana letter hi
+    0xFC, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0xC0, 0x00, // 0xCC katakana letter hu
+    0x00, 0x00, 0x30, 0x6C, 0xC6, 0x02, 0x00, 0x00, // 0xCD katakana letter he
+    0x30, 0xFC, 0x30, 0xB4, 0xB4, 0x30, 0x70, 0x00, // 0xCE katakana letter ho
+    0xFC, 0x0C, 0x18, 0x30, 0x30, 0x18, 0x18, 0x00, // 0xCF katakana letter ma
+    0x78, 0x0C, 0x78, 0x0C, 0x00, 0x78, 0x0C, 0x00, // 0xD0 katakana letter mi
+    0x18, 0x18, 0x30, 0x30, 0x64, 0x6C, 0xFC, 0x00, // 0xD1 katakana letter mu
+    0x0C, 0x0C, 0xD8, 0x70, 0x38, 0x6C, 0xC0, 0x00, // 0xD2 katakana letter me
+    0xFC, 0x30, 0xFC, 0x30, 0x30, 0x30, 0x1C, 0x00, // 0xD3 katakana letter mo
+    0x60, 0x60, 0xFC, 0x6C, 0x30, 0x30, 0x30, 0x00, // 0xD4 katakana letter ya
+    0x00, 0x78, 0x18, 0x18, 0x18, 0x18, 0xFC, 0x00, // 0xD5 katakana letter yu
+    0xFC, 0x0C, 0x0C, 0xFC, 0x0C, 0x0C, 0xFC, 0x00, // 0xD6 katakana letter yo
+    0x78, 0x00, 0xFC, 0x0C, 0x0C, 0x18, 0x60, 0x00, // 0xD7 katakana letter ra
+    0xCC, 0xCC, 0xCC, 0xCC, 0x0C, 0x18, 0x60, 0x00, // 0xD8 katakana letter ri
+    0x6C, 0x6C, 0x6C, 0x6C, 0x6C, 0x6C, 0xCC, 0x00, // 0xD9 katakana letter ru
+    0xC0, 0xC0, 0xC0, 0xC0, 0xCC, 0xD8, 0xF0, 0x00, // 0xDA katakana letter re
+    0x00, 0xFC, 0xCC, 0xCC, 0xCC, 0xFC, 0x00, 0x00, // 0xDB katakana letter ro
+    0xFC, 0xCC, 0xCC, 0x0C, 0x0C, 0x18, 0x60, 0x00, // 0xDC katakana letter wa
+    0xC0, 0x60, 0x02, 0x06, 0x0C, 0x18, 0xF0, 0x00, // 0xDD katakana letter n
+    0x28, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0xDE katakana voiced sound mark
+    0x60, 0x90, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, // 0xDF katakana semi-voiced sound mark
+};
+
+/** @brief A row of a printf character: its 8 pixels of 4 bits (0: transparent, the glyph color, the outline color), the left
+ *  pixel in the high bits
+ *  @param c Character
+ *  @param y Row (0: top)
+ *  @param outline The pixels around the glyph (the 8 pixels around each pixel of the glyph, inside the 8x8 cell) in the
+ *  outline color
+ */
+static unsigned int                 jo_vdp2_printf_row(const unsigned int c, const int y, const bool outline)
+{
+    const unsigned char             *glyph;
+    unsigned int                    bits;
+    unsigned int                    around;
+    unsigned int                    row;
+    register int                    x;
+
+    if (c < 128)
+        glyph = &__jo_vdp2_printf_font[JO_MULT_BY_8(c)];
+    else if (c >= 0xA1 && c <= 0xDF)
+        glyph = &__jo_vdp2_printf_kana_font[JO_MULT_BY_8(c - 0xA1)];
+    else
+        return (0);
+    bits = glyph[y];
+    JO_ZERO(around);
+    if (outline)
+    {
+        around = bits | (y > 0 ? glyph[y - 1] : 0) | (y < 7 ? glyph[y + 1] : 0);
+        around = (around | (around << 1) | (around >> 1)) & ~bits & 0xFF;
+    }
+    JO_ZERO(row);
+    for (JO_ZERO(x); x < 8; ++x)
+        row = (row << 4) | ((bits & (0x80 >> x)) ? JO_VDP2_PRINTF_GLYPH_COLOR : (around & (0x80 >> x)) ? JO_VDP2_PRINTF_OUTLINE_COLOR : 0);
+    return (row);
+}
+
+/** @brief Write the characters of the printf font in VRAM
+ *  @param outline With the outline (see jo_set_printf_outline())
+ *  @remarks A row of a character per write (by pixel and by byte: 29 ms at the start of each program, 68 ms with the outline)
+ */
+static void                         jo_vdp2_write_printf_font(const bool outline)
+{
+    volatile unsigned int           *cell;
+    register unsigned int           c;
+    register int                    y;
+
+    // Characters: 256 cells of 8x8 pixels at 4 bits per pixel (2 pixels per byte, left pixel in the high nibble)
+    cell = (volatile unsigned int *)(JO_VDP2_VRAM + JO_VDP2_PRINTF_CELL_OFFSET);
+    for (JO_ZERO(c); c < 256; ++c)
+        for (JO_ZERO(y); y < 8; ++y)
+            *cell++ = jo_vdp2_printf_row(c, y, outline);
+}
+
+void                                jo_set_printf_outline(const bool enabled, const jo_color color)
+{
+    register int                    k;
+
+    // (the outline color in the 8 palettes of the printf: the color 2 of each one)
+    for (JO_ZERO(k); k < 8; ++k)
+        jo_set_palette_register((unsigned short)(JO_VDP2_PRINTF_OUTLINE_COLOR + JO_MULT_BY_16(k)), color);
+    jo_vdp2_write_printf_font(enabled);
+}
+
 /** @brief Load the printf font and set NBG0 for jo_printf() */
 static void                         jo_vdp2_init_printf_font(void)
 {
-    volatile unsigned char          *cell;
     register unsigned int           c;
-    register unsigned int           y;
-    register unsigned int           x;
-    unsigned char                   bits;
 
-    // Characters: 256 cells of 8x8 pixels at 4 bits per pixel (2 pixels per byte, left pixel in the high nibble)
-    cell = (volatile unsigned char *)(JO_VDP2_VRAM + JO_VDP2_PRINTF_CELL_OFFSET);
-    for (JO_ZERO(c); c < 256; ++c)
-    {
-        for (JO_ZERO(y); y < 8; ++y)
-        {
-            bits = (c < 128) ? __jo_vdp2_printf_font[JO_MULT_BY_8(c) + y] : 0;
-            for (JO_ZERO(x); x < 8; x += 2)
-                *cell++ = ((bits & (0x80 >> x)) ? (JO_VDP2_PRINTF_GLYPH_COLOR << 4) : 0) |
-                          ((bits & (0x40 >> x)) ? JO_VDP2_PRINTF_GLYPH_COLOR : 0);
-        }
-    }
+    jo_vdp2_write_printf_font(false);
     // Map filled with spaces (a 16 colors cell is 32 bytes: 1 character number)
     for (JO_ZERO(c); c < 64 * 64; ++c)
         JO_VDP2_PRINTF_MAP[c] = JO_VDP2_PRINTF_CHARACTER_BASE + ' ';
@@ -1747,12 +1908,16 @@ static  __jo_force_inline void  __jo_switch_to_8bits_mode(void)
 
 void                            jo_img_to_vdp2_cells(const jo_img_8bits * const img, const bool vertical_flip, unsigned char *cell)
 {
+    const unsigned char         *data;
+    const unsigned char         *p;
+    unsigned int                *words;
     register int                x;
     register int                y;
-    register int                cell_x;
-    register int                cell_y;
-    register int                line_y;
+    register int                c;
     register int                i;
+    int                         width;
+    int                         height;
+    int                         step;
 
 #ifdef JO_DEBUG
         if (img == JO_NULL)
@@ -1771,23 +1936,30 @@ void                            jo_img_to_vdp2_cells(const jo_img_8bits * const 
             return ;
         }
 #endif
-    for (JO_ZERO(x); x < img->width; x += CELL_WIDTH)
+    // Each group of 8 bytes of a cell: a column of the image, 8 rows (the image turned: its columns are the rows of the
+    // screen), the columns from the right without vertical flip. Written by 4 pixels (the VRAM: a write of 32 bits costs a
+    // write of 8 bits, 148 ms for 512 x 256 pixels written by bytes) when the cells are aligned on 4 bytes
+    data = img->data;
+    width = img->width;
+    height = img->height;
+    step = vertical_flip ? 1 : -1;
+    words = (unsigned int *)cell;
+    for (JO_ZERO(x); x < width; x += CELL_WIDTH)
     {
-        for (JO_ZERO(y), JO_ZERO(line_y); y < img->height; y += CELL_HEIGHT, line_y += JO_MULT_BY_8(img->width))
+        for (JO_ZERO(y); y < height; y += CELL_HEIGHT)
         {
-            cell_x = x;
-            cell_y = line_y;
-            for (JO_ZERO(i); i < CELL_SIZE; ++i, ++cell, cell_y += img->width)
+            p = data + y * width + (vertical_flip ? x : width - x - 1);
+            for (JO_ZERO(c); c < CELL_WIDTH; ++c, p += step)
             {
-                if (i != 0 && JO_MOD_POW2(i, CELL_WIDTH) == 0)
+                if (((unsigned int)cell & 3) == 0)
                 {
-                     ++cell_x;
-                     cell_y = line_y;
+                    *words++ = ((unsigned int)p[0] << 24) | ((unsigned int)p[width] << 16) | ((unsigned int)p[2 * width] << 8) | p[3 * width];
+                    *words++ = ((unsigned int)p[4 * width] << 24) | ((unsigned int)p[5 * width] << 16) | ((unsigned int)p[6 * width] << 8) |
+                               p[7 * width];
                 }
-                if (!vertical_flip)
-                    *cell = img->data[(img->width - cell_x - 1) + cell_y];
                 else
-                    *cell = img->data[cell_x + cell_y];
+                    for (JO_ZERO(i); i < CELL_HEIGHT; ++i)
+                        cell[(x * height + y * CELL_WIDTH + c * CELL_HEIGHT) + i] = p[i * width];
             }
         }
     }
@@ -2854,17 +3026,19 @@ static bool                         __jo_vdp2_glow_saved_rbg0;
 /** @brief Show the glow layers (internal usage, see glow.c)
  *  @param cells Characters (16 colors, in the VRAM bank B0)
  *  @param map2 Map of NBG2 (1 page of 64 x 64 cells, in the bank B0)
- *  @param map3 Map of NBG3
+ *  @param map3 Map of NBG3, JO_NULL: NBG2 only (NBG3 stays as it is)
  *  @param cram_block Color RAM block of 256 colors of their palettes (0 to 7)
  *  @remarks The rotation screen is hidden (its pattern names are in the bank B0, read by the glow layers instead): the
  *           glows are for the places where the 3D planes are not seen (inside)
  */
 void                                __jo_vdp2_glow_layers_show(const void *cells, const void *map2, const void *map3, const int cram_block)
 {
+    unsigned short                  layers;
     int                             n;
 
     if (__jo_vdp2_glow_layers_shown)
         return;
+    layers = map3 != JO_NULL ? (JO_NBG2_SCREEN | JO_NBG3_SCREEN) : JO_NBG2_SCREEN;
     __jo_vdp2_glow_layers_shown = true;
     __jo_vdp2_glow_saved_ramctl = JO_VDP2_GET(JO_VDP2_RAMCTL);
     __jo_vdp2_glow_saved_ccctl = JO_VDP2_GET(JO_VDP2_CCCTL);
@@ -2874,7 +3048,7 @@ void                                __jo_vdp2_glow_layers_show(const void *cells
     // The bank B0 is not read by the rotation screen (its pattern names): the cycle patterns give its slots to NBG2, NBG3
     JO_REMOVE_FLAG(screen_flags, JO_RBG0_SCREEN);
     JO_VDP2_SET(JO_VDP2_RAMCTL, __jo_vdp2_glow_saved_ramctl & ~JO_VDP2_RAMCTL_ROTATION_DATA(2, 3));
-    for (n = JO_VDP2_SCREEN_NBG2; n <= JO_VDP2_SCREEN_NBG3; ++n)
+    for (n = JO_VDP2_SCREEN_NBG2; n <= (map3 != JO_NULL ? JO_VDP2_SCREEN_NBG3 : JO_VDP2_SCREEN_NBG2); ++n)
     {
         jo_vdp2_set_character_mode(n, JO_VDP2_COLOR_16, 0);
         jo_vdp2_set_cell(n, cells, JO_VDP2_PATTERN_1WORD | JO_VDP2_PATTERN_12BIT);
@@ -2885,10 +3059,9 @@ void                                __jo_vdp2_glow_layers_show(const void *cells
     JO_VDP2_SET(JO_VDP2_PRINB, JO_VDP2_PRIORITY_PAIR(7, 7));
     // Their colors in the block of the color RAM
     JO_VDP2_SET(JO_VDP2_CRAOFA, (__jo_vdp2_glow_saved_craofa & 0x00FF) | ((cram_block & 7) << 8) | ((cram_block & 7) << 12));
-    // Color calculation of NBG2 and NBG3: added to the image under them
-    JO_VDP2_SET(JO_VDP2_CCCTL, (__jo_vdp2_glow_saved_ccctl & ~(JO_VDP2_CCCTL_MODE_MASK | JO_NBG2_SCREEN | JO_NBG3_SCREEN)) |
-                               JO_VDP2_CCCTL_ADD | JO_NBG2_SCREEN | JO_NBG3_SCREEN);
-    JO_ADD_FLAG(screen_flags, JO_NBG2_SCREEN | JO_NBG3_SCREEN);
+    // Color calculation of the layers: added to the image under them
+    JO_VDP2_SET(JO_VDP2_CCCTL, (__jo_vdp2_glow_saved_ccctl & ~(JO_VDP2_CCCTL_MODE_MASK | layers)) | JO_VDP2_CCCTL_ADD | layers);
+    JO_ADD_FLAG(screen_flags, layers);
     jo_vdp2_set_displayed_screens(screen_flags);
 }
 
@@ -3413,6 +3586,16 @@ void                                    jo_vdp2_disable_special_blend(const jo_s
     jo_vdp2_update_special_functions();
 }
 
+/** @brief Condition of the color calculation of the sprites (jo_vdp2_blend_rgb_sprites_only()) */
+static unsigned short                   __jo_vdp2_sprite_blend_condition = JO_VDP2_SPCTL_COLOR_CALC_ALL;
+
+void                                    jo_vdp2_blend_rgb_sprites_only(const bool rgb_only)
+{
+    __jo_vdp2_sprite_blend_condition = rgb_only ? JO_VDP2_SPCTL_COLOR_CALC_MSB : JO_VDP2_SPCTL_COLOR_CALC_ALL;
+    if (JO_VDP2_GET(JO_VDP2_CCCTL) & JO_SPRITE_SCREEN)
+        JO_VDP2_SET_BITS(JO_VDP2_SPCTL, JO_VDP2_SPCTL_COLOR_CALC_MASK, __jo_vdp2_sprite_blend_condition);
+}
+
 void                                    jo_vdp2_enable_blend(const jo_scroll_screen screens, unsigned char ratio)
 {
     unsigned short                      both;
@@ -3430,11 +3613,12 @@ void                                    jo_vdp2_enable_blend(const jo_scroll_scr
         JO_VDP2_SET_BITS(JO_VDP2_CCRNB, JO_VDP2_COLOR_RATE_HIGH_MASK, ratio << 8);
     if (screens & JO_RBG0_SCREEN)
         JO_VDP2_SET_BITS(JO_VDP2_CCRR, JO_VDP2_COLOR_RATE_LOW_MASK, ratio);
+    // (JO_BACK_SCREEN is also JO_LNCL_SCREEN: the ratio of the back screen and of the line color screen)
     if (screens & JO_BACK_SCREEN)
-        JO_VDP2_SET_BITS(JO_VDP2_CCRLB, JO_VDP2_COLOR_RATE_HIGH_MASK, ratio << 8);
+        JO_VDP2_SET(JO_VDP2_CCRLB, both);
     if (screens & JO_SPRITE_SCREEN)
     {
-        JO_VDP2_SET_BITS(JO_VDP2_SPCTL, JO_VDP2_SPCTL_COLOR_CALC_MASK, JO_VDP2_SPCTL_COLOR_CALC_ALL);
+        JO_VDP2_SET_BITS(JO_VDP2_SPCTL, JO_VDP2_SPCTL_COLOR_CALC_MASK, __jo_vdp2_sprite_blend_condition);
         JO_VDP2_SET(JO_VDP2_CCRSA, both);
         JO_VDP2_SET(JO_VDP2_CCRSB, both);
         JO_VDP2_SET(JO_VDP2_CCRSC, both);
@@ -3448,6 +3632,94 @@ void                                    jo_vdp2_disable_blend(const jo_scroll_sc
     JO_VDP2_SET_BITS(JO_VDP2_CCCTL, screens & JO_VDP2_CCCTL_SCREENS_MASK, 0);
     if (screens & JO_SPRITE_SCREEN)
         JO_VDP2_SET_BITS(JO_VDP2_SPCTL, JO_VDP2_SPCTL_COLOR_CALC_MASK, 0);
+}
+
+/*
+** Line color screen
+*/
+
+/** @brief LCTAU: one color per line (0: one color for the whole screen) */
+# define JO_VDP2_LCTAU_LINE_MODE            (1 << 15)
+/** @brief LNCLEN: the line color screen inserted under NBG0 to NBG3 and RBG0 (bits 0 to 4) and the sprites (bit 5) */
+# define JO_VDP2_LNCLEN_SCREENS_MASK        (0x001F)
+# define JO_VDP2_LNCLEN_SPRITE              (1 << 5)
+/** @brief A line color: an index of the color RAM (11 bits) */
+# define JO_VDP2_LINE_COLOR_MASK            (0x07FF)
+
+/** @brief Line color tables (2: the table displayed is not changed during the display), and the single color */
+static unsigned short                   *__jo_vdp2_line_colors[2] = {JO_NULL, JO_NULL};
+static int                              __jo_vdp2_line_colors_index = 0;
+static unsigned short                   *__jo_vdp2_line_color = JO_NULL;
+
+static void                             jo_vdp2_set_line_color_table(const unsigned short * const table, const bool per_line)
+{
+    unsigned int                        offset;
+
+    offset = jo_vdp2_vram_offset(table) >> 1;
+    JO_VDP2_SET(JO_VDP2_LCTAU, (per_line ? JO_VDP2_LCTAU_LINE_MODE : 0) | ((offset >> 16) & JO_VDP2_TABLE_ADDRESS_HIGH_MASK));
+    JO_VDP2_SET(JO_VDP2_LCTAL, offset & JO_VDP2_TABLE_ADDRESS_LOW_16BITS_MASK);
+}
+
+bool                                    jo_vdp2_set_line_colors(const unsigned short * const colors, const int count)
+{
+    unsigned short                      *table;
+    int                                 line;
+
+#ifdef JO_DEBUG
+    if (colors == JO_NULL || count <= 0)
+    {
+        jo_core_error("colors is null or count <= 0");
+        return (false);
+    }
+#endif
+    __jo_vdp2_line_colors_index ^= 1;
+    if ((table = __jo_vdp2_line_colors[__jo_vdp2_line_colors_index]) == JO_NULL &&
+        (table = __jo_vdp2_line_colors[__jo_vdp2_line_colors_index] =
+         (unsigned short *)jo_vdp2_malloc(JO_VDP2_LINE_COLOR_TABLE, JO_VDP2_LINE_COLOR_LINES * sizeof(unsigned short))) == JO_NULL)
+    {
+#ifdef JO_DEBUG
+        jo_core_error("Out of VDP2 memory");
+#endif
+        return (false);
+    }
+    // (the lines after count: the last color)
+    for (JO_ZERO(line); line < JO_VDP2_LINE_COLOR_LINES; ++line)
+        table[line] = colors[line < count ? line : count - 1] & JO_VDP2_LINE_COLOR_MASK;
+    jo_vdp2_set_line_color_table(table, true);
+    return (true);
+}
+
+bool                                    jo_vdp2_set_line_color(const unsigned short color)
+{
+    if (__jo_vdp2_line_color == JO_NULL &&
+        (__jo_vdp2_line_color = (unsigned short *)jo_vdp2_malloc(JO_VDP2_LINE_COLOR_TABLE, sizeof(unsigned short))) == JO_NULL)
+    {
+#ifdef JO_DEBUG
+        jo_core_error("Out of VDP2 memory");
+#endif
+        return (false);
+    }
+    *__jo_vdp2_line_color = color & JO_VDP2_LINE_COLOR_MASK;
+    jo_vdp2_set_line_color_table(__jo_vdp2_line_color, false);
+    return (true);
+}
+
+static unsigned short                   jo_vdp2_line_color_bits(const jo_scroll_screen screens)
+{
+    return ((unsigned short)((screens & JO_VDP2_LNCLEN_SCREENS_MASK) | (screens & JO_SPRITE_SCREEN ? JO_VDP2_LNCLEN_SPRITE : 0)));
+}
+
+void                                    jo_vdp2_enable_line_color(const jo_scroll_screen screens)
+{
+    unsigned short                      bits;
+
+    bits = jo_vdp2_line_color_bits(screens);
+    JO_VDP2_SET_BITS(JO_VDP2_LNCLEN, bits, bits);
+}
+
+void                                    jo_vdp2_disable_line_color(const jo_scroll_screen screens)
+{
+    JO_VDP2_SET_BITS(JO_VDP2_LNCLEN, jo_vdp2_line_color_bits(screens), 0);
 }
 
 void                                    jo_vdp2_enable_shadow(const jo_scroll_screen screens)

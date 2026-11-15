@@ -308,6 +308,14 @@ typedef struct
  *  @return false if the VDP1 command table is full
  *  @remarks Hidden polygons (behind the camera, outside the window or seen from the back) are skipped
  */
+/** @brief Draw some ranges of polygons whose points are known: only the points from first_point to point_count - 1 are
+ *  transformed (see jo_3d_mesh_draw_ranges(); the chunks of the cells)
+ *  @param first_point First point used by the polygons of the ranges (none before it)
+ */
+bool                                __jo_3d_draw_ranges_from(const jo_3d_polygon_data * const pdata, const unsigned int first_point,
+                                                             const unsigned int point_count,
+                                                             const jo_3d_polygon_range * const ranges, const int range_count);
+
 bool                                __jo_3d_draw_ranges(const jo_3d_polygon_data * const pdata, const unsigned int point_count,
                                                         const jo_3d_polygon_range * const ranges, const int range_count);
 
@@ -924,6 +932,43 @@ static  __jo_force_inline void      jo_3d_rotate_matrix_rad_z(float z)
     __jo_3d_rotate(JO_3D_AXIS_Z, JO_RAD_TO_ANGLE(z));
 }
 
+/** @brief Rotate 3D matrix using jo_angle (0x10000 = 360 degrees: a fraction of degree, no float)
+ *  @param x X Angle
+ *  @param y Y Angle
+ *  @param z Z Angle
+ *  @remarks Same order as jo_3d_rotate_matrix(): X, then Y, then Z
+ */
+static  __jo_force_inline void      jo_3d_rotate_matrix_angle(const jo_angle x, const jo_angle y, const jo_angle z)
+{
+    __jo_3d_rotate(JO_3D_AXIS_X, x);
+    __jo_3d_rotate(JO_3D_AXIS_Y, y);
+    __jo_3d_rotate(JO_3D_AXIS_Z, z);
+}
+
+/** @brief Rotate 3D matrix using jo_angle (X axis)
+ *  @param x X Angle (0x10000 = 360 degrees)
+ */
+static  __jo_force_inline void      jo_3d_rotate_matrix_angle_x(const jo_angle x)
+{
+    __jo_3d_rotate(JO_3D_AXIS_X, x);
+}
+
+/** @brief Rotate 3D matrix using jo_angle (Y axis)
+ *  @param y Y Angle (0x10000 = 360 degrees)
+ */
+static  __jo_force_inline void      jo_3d_rotate_matrix_angle_y(const jo_angle y)
+{
+    __jo_3d_rotate(JO_3D_AXIS_Y, y);
+}
+
+/** @brief Rotate 3D matrix using jo_angle (Z axis)
+ *  @param z Z Angle (0x10000 = 360 degrees)
+ */
+static  __jo_force_inline void      jo_3d_rotate_matrix_angle_z(const jo_angle z)
+{
+    __jo_3d_rotate(JO_3D_AXIS_Z, z);
+}
+
 /*
 ███╗   ███╗ █████╗ ████████╗██████╗ ██╗██╗  ██╗    ████████╗██████╗  █████╗ ███╗   ██╗███████╗██╗      █████╗ ████████╗██╗ ██████╗ ███╗   ██╗
 ████╗ ████║██╔══██╗╚══██╔══╝██╔══██╗██║╚██╗██╔╝    ╚══██╔══╝██╔══██╗██╔══██╗████╗  ██║██╔════╝██║     ██╔══██╗╚══██╔══╝██║██╔═══██╗████╗  ██║
@@ -1255,6 +1300,19 @@ static  __jo_force_inline void      jo_3d_perspective_angle(const int angle)
     __jo_3d_set_perspective(jo_DEGtoANG_int(angle));
 }
 
+/** @brief Set the perspective angle using jo_angle (a fraction of degree, as slPerspective() of the SGL)
+ *  @param angle Angle (0x10000 = 360 degrees) from JO_DEG_TO_ANGLE(10) to JO_DEG_TO_ANGLE(160)
+ *  @remarks Same as jo_3d_perspective_angle() for a whole degree
+ */
+static  __jo_force_inline void      jo_3d_set_perspective(const jo_angle angle)
+{
+#ifdef JO_DEBUG
+    if (angle < JO_DEG_TO_ANGLE(10) || angle > JO_DEG_TO_ANGLE(160))
+        jo_core_error("Valid angle range is 10 to 160 degrees");
+#endif
+    __jo_3d_set_perspective(angle);
+}
+
 /** @brief Set the display level of the viewing volume
  *  @param level Distance from the viewpoint and the projection surface
  */
@@ -1496,6 +1554,43 @@ bool                                jo_3d_mesh_ray_hit_with_planes(const jo_3d_m
 bool                                jo_3d_draw_standing_sprite(const int sprite_id, const jo_pos3D_fixed * const foot, const jo_fixed width,
                                                                const jo_fixed height, const jo_fixed sway, const bool flip);
 
+/*
+** Fade of the far standing sprites: they appear little by little instead of all at once (the trees at the end of the view).
+** Their pixels are mixed with the screens of the VDP2 under them (the sky) by the color calculation of the sprites: each
+** pixel once, at the display (a half transparent polygon of the VDP1 can't be mixed with the VDP2, and its pixels drawn
+** twice by the lines of a quad were mixed twice). A sprite that fades is drawn with its 16 colors in a bank of the color
+** RAM: the color calculation bits of the palette pixels (sprite type 3: bits 12 and 11) choose one of the 4 ratios of the
+** sprites, the bits 0 (near: opaque) to JO_3D_FADE_LEVELS (far: the most transparent).
+** The VDP2: jo_vdp2_set_blend_mode(JO_VDP2_BLEND_RATIO); jo_vdp2_enable_blend(JO_SPRITE_SCREEN, 0);
+** jo_vdp2_set_sprite_blend_ratios(0, 8, 16, 24) (ratio 0: the other sprites stay opaque)
+*/
+
+/** @brief Levels of the fade (the color calculation ratios 1 to 3 of the sprites, see jo_vdp2_set_sprite_blend_ratios()) */
+# define JO_3D_FADE_LEVELS                  (3)
+/** @brief Bit of the level in the color code of a sprite (sprite type 3: its color calculation bits 12 and 11) */
+# define JO_3D_FADE_LEVEL_SHIFT             (11)
+
+/** @brief A standing sprite that fades with the distance (see jo_3d_set_fade_distances()): its 16 colors copied in a bank of
+ *  a palette, used beyond the start of the fade
+ *  @param sprite_id A 16 colors texture with its color lookup table (jo_sprite_add_image_4bits_lut()); its smaller copies too
+ *  @param palette Palette of the bank (jo_create_palette()); JO_NULL: the sprite no longer fades
+ *  @param bank Bank of 16 colors in the palette: 1 to 15 (its colors bank * 16 + 1 to bank * 16 + 15 of the palette)
+ *  @return false if the sprite is not a 16 colors texture with its table, or if 16 sprites already fade
+ *  @remarks Freed sprites are forgotten (jo_sprite_free_from()). A palette pixel is not shaded (gouraud) by the VDP1
+ *  @remarks The color calculation mode is the same for all the screens: not with the additive sprites
+ *  (jo_enable_additive_sprites()) or the glows (jo/glow.h) at the same time, stop the fade then (jo_3d_set_fade_distances(0, 0))
+ *  @remarks Not in the 640 and 704 pixels modes
+ */
+bool                                jo_3d_set_sprite_fade(const int sprite_id, const jo_palette * const palette, const int bank);
+
+/** @brief The distances of the fade of the standing sprites (see jo_3d_set_sprite_fade()): opaque up to start, then
+ *  JO_3D_FADE_LEVELS levels more and more transparent up to end (beyond: the most transparent; don't draw them)
+ *  @param start Depth of the start (world units, Q16.16)
+ *  @param end Depth of the end (world units, Q16.16); end <= start: no fade (the default)
+ *  @remarks The slave CPU takes them at jo_3d_slave_begin() (see jo_3d_slave_set_fade_distances())
+ */
+void                                jo_3d_set_fade_distances(const jo_fixed start, const jo_fixed end);
+
 /** @brief Create an empty mesh made of shared points and polygons (indexes of the points)
  *  @param point_count Point count
  *  @param polygon_count Polygon count
@@ -1558,6 +1653,16 @@ void                                jo_3d_set_texture_subdivision_depth(const in
  *  straight; about 1 ms more for each CPU in a room of a level (more polygons drawn in parts)
  */
 void                                jo_3d_set_texture_subdivision_error(const int sprite_id, const int pixels);
+
+/** @brief Draw the polygons in parts only where it is needed to draw them at all (see jo_3d_set_texture_subdivision()): the
+ *  polygons that cross the near plane, and those beyond the guard band in 2 x 2 parts only (see jo_3d_set_guard_band(); a
+ *  bigger guard band keeps them few); not for the perspective of their texture, nor the big ones mostly out of the screen
+ *  (the VDP1 draws their pixels out of the screen too)
+ *  @param enabled true: fewer parts (the CPU time of the parts saved), false: the default
+ *  @remarks For both CPUs. A split screen (2 views per frame, each one half as high: the texture slides less, the VDP1 has
+ *  time to spare): about 10 % of the time of the CPUs (Mednafen emulated the split screen of the rally demo 10 % faster)
+ */
+void                                jo_3d_set_fewer_parts(const bool enabled);
 
 /** @brief Create smaller copies of a texture (half and quarter size, "mipmaps") used when the texture is drawn small
  *  @param sprite_id Texture (RGB sprite, width multiple of 16: half size, of 32: quarter size too)
@@ -1653,6 +1758,11 @@ void                                jo_3d_slave_set_scale_fixed(const jo_fixed x
 bool                                jo_3d_slave_mesh_draw_ranges(const jo_3d_mesh * const mesh, const unsigned int point_count,
                                                                  const jo_3d_polygon_range * const ranges, const int range_count);
 
+/** @brief jo_3d_slave_mesh_draw_ranges() with the points of the ranges known (see __jo_3d_draw_ranges_from()) */
+bool                                __jo_3d_slave_draw_ranges_from(const jo_3d_mesh * const mesh, const unsigned int first_point,
+                                                                   const unsigned int point_count,
+                                                                   const jo_3d_polygon_range * const ranges, const int range_count);
+
 /** @brief Draw a mesh on the slave CPU (call it on the slave CPU, between jo_3d_slave_begin() and jo_3d_slave_end())
  *  @param mesh Mesh (1024 points at most, JO_3D_SLAVE_MAX_VERTICES)
  *  @return false if the command table of the slave CPU is full (960 commands)
@@ -1683,6 +1793,13 @@ int                                 jo_3d_slave_get_command_count(void);
 bool                                jo_3d_slave_draw_standing_sprite(const int sprite_id, const jo_pos3D_fixed * const foot,
                                                                      const jo_fixed width, const jo_fixed height,
                                                                      const jo_fixed sway, const bool flip);
+
+/** @brief The distances of the fade of the standing sprites of the slave CPU (see jo_3d_set_fade_distances()), until the
+ *  next jo_3d_slave_begin() (call it on the slave CPU)
+ *  @param start Depth of the start (world units, Q16.16)
+ *  @param end Depth of the end (world units, Q16.16); end <= start: no fade
+ */
+void                                jo_3d_slave_set_fade_distances(const jo_fixed start, const jo_fixed end);
 
 /** @brief Commands drawn by the slave CPU since jo_3d_slave_begin() (0 after jo_3d_slave_end())
  *  @return Command count

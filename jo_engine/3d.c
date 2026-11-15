@@ -386,6 +386,9 @@ typedef struct
     int                                     sprite;             // The tiles (one under the other)
     int                                     tiles;              // Tiles on a side
     int                                     first_sprite;       // Its first sprite (forgotten when it is freed)
+    unsigned int                            tile_step;          // The address of a tile after the previous one (/ 8)
+    unsigned int                            tile_size;          // The width / 8 and the height of a tile (low word of the
+                                                                // texture words of a command)
 }                                           jo_3d_environment;
 
 static jo_3d_environment                    __jo_3d_environments[JO_3D_ENVIRONMENT_MESHES];
@@ -705,6 +708,18 @@ void                                        jo_3d_prepare_tint(const jo_3d_mesh 
         jo_3d_tint_offset(&mesh->data);
 }
 
+/** @brief The sprites that fade with the distance, at most (see jo_3d_set_sprite_fade()) */
+# define JO_3D_FADE_SPRITES                 (16)
+
+typedef struct
+{
+    short                                   sprite;     // Sprite (its smaller copies too)
+    unsigned short                          bank;       // Color code of its color 0 (multiple of 16)
+}                                           jo_3d_fade_sprite;
+
+static jo_3d_fade_sprite                    __jo_3d_fade_sprites[JO_3D_FADE_SPRITES];
+static int                                  __jo_3d_fade_sprite_count = 0;
+
 void                                        __jo_3d_forget_sprites_from(const int sprite_id)
 {
     int                                     i;
@@ -724,6 +739,10 @@ void                                        __jo_3d_forget_sprites_from(const in
             __jo_3d_mipmaps[i].levels = 0;
         jo_3d_update_texture_flags(i);
     }
+    // The sprites that fade (see jo_3d_set_sprite_fade())
+    for (i = __jo_3d_fade_sprite_count - 1; i >= 0; --i)
+        if (__jo_3d_fade_sprites[i].sprite >= sprite_id)
+            __jo_3d_fade_sprites[i] = __jo_3d_fade_sprites[--__jo_3d_fade_sprite_count];
     // The environment maps
     for (JO_ZERO(i); i < JO_3D_ENVIRONMENT_MESHES; ++i)
         if (__jo_3d_environments[i].key != JO_NULL && __jo_3d_environments[i].first_sprite >= sprite_id)
@@ -779,6 +798,8 @@ static unsigned int                         __jo_3d_clip_table_base = 0;
 
 /* Clipping: the polygons are clipped when they go further than this distance outside of the screen (see jo_3d_set_guard_band()) */
 int                                         __jo_3d_guard_band = JO_3D_DEFAULT_GUARD_BAND;
+/** @brief See jo_3d_set_fewer_parts() (read by both CPUs: through the cache-through address) */
+static volatile bool                        __jo_3d_fewer_parts = false;
 #ifdef JO_TEST_SPAN
 /* Test (JO_TEST_SPAN, read by the game): the vertices transformed by the master CPU, its polygons, the points of their meshes */
 unsigned int                                __jo_3d_test_span[3];
@@ -3222,8 +3243,10 @@ static  __jo_force_inline int               jo_3d_subdivision_level_unbudgeted(j
     // texture: the texture broke along the cuts). All the textures with tiles, not only JO_3D_TILES_NEAR_ONLY: a big wall
     // facing the camera 25 units away (no perspective to correct) was cut by the edges of the screen and got its whole
     // texture on the screen (tests/harness/glitch.py, the room)
+    // (fewer parts, see jo_3d_set_fewer_parts(): 2 x 2 parts. Clipped by the CPU at the edges of the screen as one polygon,
+    // the texture of a polygon near the camera broke: the lines of a road, the facades of the split screen of the rally demo)
     if (any & JO_3D_CODE_GUARD)
-        return (JO_3D_TILE_LEVEL_COUNT(tiles) >= 2 ? 4 : 2);
+        return (*(volatile bool *)JO_CACHE_THROUGH(&__jo_3d_fewer_parts) || JO_3D_TILE_LEVEL_COUNT(tiles) < 2 ? 2 : 4);
     // Size on the screen (the vertices are projected)
     // (each position read once)
     for (k = 0; k < 4; ++k)
@@ -3239,7 +3262,9 @@ static  __jo_force_inline int               jo_3d_subdivision_level_unbudgeted(j
     // spends a lot of time on each half transparent pixel, out of the screen too: it reads the frame buffer)
     // The same for a big polygon of a model cut in small quads when it was made (a wall next to the camera: its parts out of the
     // screen cost VDP1 time too, 3 times more in a stairwell)
-    if ((any & JO_3D_CODE_SCREEN) && ((a->draw_mode & JO_VDP1_COLOR_CALC_HALF_TRANSPARENT) == JO_VDP1_COLOR_CALC_HALF_TRANSPARENT ||
+    // (not with fewer parts, see jo_3d_set_fewer_parts(): the VDP1 draws their pixels out of the screen)
+    if (!*(volatile bool *)JO_CACHE_THROUGH(&__jo_3d_fewer_parts) && (any & JO_3D_CODE_SCREEN) &&
+        ((a->draw_mode & JO_VDP1_COLOR_CALC_HALF_TRANSPARENT) == JO_VDP1_COLOR_CALC_HALF_TRANSPARENT ||
                                       (tiles->levels & JO_3D_TILES_NEAR_ONLY)) &&
         jo_3d_is_mostly_out_of_screen(xmin, ymin, xmax, ymax, __jo_vdp1_system_clip_right, __jo_vdp1_system_clip_bottom))
         // (2 x 2 parts for an opaque polygon: the parts cost CPU time)
@@ -3251,6 +3276,9 @@ static  __jo_force_inline int               jo_3d_subdivision_level_unbudgeted(j
         JO_SUB_REASON(1);
         return (0);
     }
+    // (fewer parts: not for the perspective of the texture)
+    if (*(volatile bool *)JO_CACHE_THROUGH(&__jo_3d_fewer_parts))
+        return (0);
     size = JO_MAX(xmax - xmin, ymax - ymin);
     // (the distortion allowed: the one of the texture, else the default)
     limit = tiles->error != 0 ? tiles->error : JO_3D_SUBDIVISION_ERROR;
@@ -3328,6 +3356,7 @@ typedef struct
     bool                                    triangle;           // The polygon is a triangle (its last 2 vertices are the same)
     bool                                    flip_x;             // The tiles are read from the right (mirrored or flipped)
     bool                                    flip_y;             // The tiles are read from the bottom (flipped)
+    bool                                    fast;               // Its parts by jo_3d_emit_part() (see jo_3d_emit_subdivided_polygon())
     unsigned int                            tile_words[JO_3D_TILE_FINE_LEVELS]; // Texture words of the command of the first tile of each
     unsigned int                            tile_step[JO_3D_TILE_FINE_LEVELS];  // level (address and size, see jo_3d_emit_tile_part()),
                                                                 // and from a tile to the next
@@ -4587,6 +4616,121 @@ static int                                  jo_3d_emit_near_tile(const jo_3d_sub
  *  @param parent_edges Edges of the part on the edges of the part it was cut from (bit k: from the corner k to k + 1), 0: none
  *  @return false if the command table is full
  */
+/** @brief jo_3d_emit_polygon() for a part of a subdivided polygon drawn as it is (see jo_3d_emit_tile_part()): the same
+ *  command, for the usual case only (see jo_3d_subdivision.fast: one plane, textured by its tile, not lit, no mirror, no front
+ *  layer, sorted on its center or on the key of the whole polygon), 6 arguments instead of 13 and none of the tests of the other
+ *  cases (jo_3d_emit_polygon_call(): about 280 instructions, 610 cycles a part; 315 cycles here, Mednafen)
+ *  @return false if the command table is full
+ */
+static __attribute__((noinline)) bool       jo_3d_emit_part(const jo_3d_subdivision * const s, jo_3d_vertex * const v0, jo_3d_vertex * const v1,
+                                                            jo_3d_vertex * const v2, jo_3d_vertex * const v3, const unsigned short * const colors)
+{
+    jo_3d_cpu_context                       *ctx;
+    const jo_3d_polygon_attribute           *a;
+    jo_3d_command_word                      *words;
+    volatile unsigned int                   *table;
+    unsigned int                            pmod;
+    unsigned int                            grda;
+    unsigned int                            used;
+    jo_fixed                                key;
+    int                                     sort_key;
+    int                                     cross;
+    int                                     tri;
+    int                                     index;
+    int                                     x0;
+    int                                     y0;
+    int                                     x1;
+    int                                     y1;
+    int                                     x2;
+    int                                     y2;
+    int                                     x3;
+    int                                     y3;
+
+    ctx = s->ctx;
+    a = s->a;
+    used = *s->used;
+    // (a polygon of the mean color of its texture, or the command table full: the general case)
+    if (ctx->sliver_color != 0 || ctx->texture_words == 0 || used >= s->reserved)
+        return (jo_3d_emit_polygon_call(ctx, v0, v1, v2, v3, colors, s->p, a, s->commands, s->keys, s->reserved, s->used, s->light));
+    x0 = JO_3D_VERTEX_X(v0);
+    y0 = JO_3D_VERTEX_Y(v0);
+    x1 = JO_3D_VERTEX_X(v1);
+    y1 = JO_3D_VERTEX_Y(v1);
+    x2 = JO_3D_VERTEX_X(v2);
+    y2 = JO_3D_VERTEX_Y(v2);
+    x3 = JO_3D_VERTEX_X(v3);
+    y3 = JO_3D_VERTEX_Y(v3);
+    // Facing (see jo_3d_emit_polygon(): one plane, its 2 triangles facing away)
+    cross = (x2 - x0) * (y3 - y1) - (x3 - x1) * (y2 - y0);
+    if (cross < 0)
+    {
+        tri = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+        if (tri < 0 && cross < tri)
+            return (true);
+    }
+    // Sort key: the key of the whole polygon (JO_3D_SORT_MIN, JO_3D_SORT_MAX), else its center
+    if (ctx->forced_key >= 0)
+        key = ctx->forced_key;
+    else
+        key = (JO_DIV_BY_4(v0->zc) + JO_DIV_BY_4(v1->zc) + JO_DIV_BY_4(v2->zc) + JO_DIV_BY_4(v3->zc)) & ~JO_3D_CODE_MASK;
+    if (key < __jo_vdp1_near_z)
+        key = __jo_vdp1_near_z;
+    ctx->previous_polygon_z = key;
+    sort_key = JO_FIXED_TO_INT(key) + *ctx->depth_bias;
+    s->keys[used] = sort_key < 0 ? 0 : (sort_key > JO_VDP1_MAX_KEY ? JO_VDP1_MAX_KEY : (unsigned short)sort_key);
+    words = (jo_3d_command_word *)&s->commands[used];
+    *s->used = used + 1;
+    ++*ctx->displayed_polygon_count;
+    pmod = a->draw_mode | ctx->clip_mode;
+    // (the pre-clipping, see jo_3d_emit_polygon())
+    if (ctx->clip_mode == 0)
+    {
+        const unsigned int                  area = ((unsigned int)__jo_vdp1_system_clip_right << 16) | (unsigned short)__jo_vdp1_system_clip_bottom;
+        const unsigned int                  p0 = (unsigned int)v0->xy;
+        const unsigned int                  p1 = (unsigned int)v1->xy;
+        const unsigned int                  p2 = (unsigned int)v2->xy;
+        const unsigned int                  p3 = (unsigned int)v3->xy;
+
+        if (((p0 | p1 | p2 | p3 | (area - p0) | (area - p1) | (area - p2) | (area - p3)) & 0x80008000u) == 0)
+            pmod |= JO_VDP1_PRE_CLIPPING_DISABLE;
+    }
+    grda = (pmod & JO_VDP1_COLOR_CALC_GOURAUD) ? (a->gouraud_table != 0 ? (unsigned short)(a->gouraud_table + ctx->gouraud_offset) : 0) : 0;
+    // The gouraud table of the part (2 32 bits writes: an access to the VRAM is slow, the table is 8 bytes aligned)
+    if (colors != JO_NULL && (index = jo_3d_clip_table(ctx)) >= 0)
+    {
+        table = (volatile unsigned int *)(JO_VDP1_VRAM + JO_VDP1_CLIP_GOURAUD_TABLE_OFFSET + JO_MULT_BY_8(index));
+        table[0] = ((unsigned int)colors[0] << 16) | colors[1];
+        table[1] = ((unsigned int)colors[2] << 16) | colors[3];
+        grda = JO_DIV_BY_8(JO_VDP1_CLIP_GOURAUD_TABLE_OFFSET) + index;
+    }
+    // The tile (the VDP1 reads the lines of a texture flipped horizontally from their end: it would stop at the end codes)
+    if ((a->direction & JO_VDP1_H_FLIP) && __jo_sprite_end_codes[a->texture_id])
+        pmod |= JO_VDP1_END_CODE_DISABLE;
+    words[0] = (unsigned int)(JO_VDP1_CMD_DISTORTED_SPRITE | (a->direction & JO_VDP1_DIRECTION_FLIP_MASK)) << 16;
+    words[1] = (pmod << 16) | a->color;
+    words[2] = ctx->texture_words;
+    words[3] = (unsigned int)v0->xy;
+    words[4] = (unsigned int)v1->xy;
+    words[5] = (unsigned int)v2->xy;
+    words[6] = (unsigned int)v3->xy;
+    words[7] = grda << 16;
+#ifdef JO_COMPILE_WITH_PROFILER_SUPPORT
+    if (__jo_profile_pixels)
+    {
+        // (see jo_3d_emit_polygon())
+        unsigned int                        texture_words;
+        int                                 lines;
+        int                                 width;
+
+        texture_words = ctx->texture_words;
+        lines = JO_MAX(JO_MAX(JO_ABS(x3 - x0), JO_ABS(y3 - y0)), JO_MAX(JO_ABS(x2 - x1), JO_ABS(y2 - y1)));
+        width = JO_MAX(JO_MAX(JO_ABS(x1 - x0), JO_ABS(y1 - y0)), JO_MAX(JO_ABS(x2 - x3), JO_ABS(y2 - y3)));
+        ctx->pixels += (JO_MAX(lines, (int)(texture_words & 0xFF)) + 1) * (JO_MAX(width, (int)JO_MULT_BY_8((texture_words >> 8) & 0x3F)) + 1);
+    }
+#endif
+    return (true);
+}
+
 /** @brief The last level of jo_3d_emit_tile(): one part, with its tile of the texture (inlined in jo_3d_emit_subdivided_polygon()
  *  for the parts that don't cross the near plane: no call of the recursive jo_3d_emit_tile(), its big stack frame; the
  *  command itself by jo_3d_emit_polygon_call())
@@ -4653,13 +4797,15 @@ static  __jo_force_inline bool              jo_3d_emit_tile_part(const jo_3d_sub
                 return (result);
         }
         if (borders == 0)
-            result = jo_3d_emit_polygon_call(s->ctx, pc[0], pc[1], pc[2], pc[3], colors, s->p, s->a, s->commands,
-                                        s->keys, s->reserved, s->used, s->light);
+            result = s->fast ? jo_3d_emit_part(s, pc[0], pc[1], pc[2], pc[3], colors) :
+                     jo_3d_emit_polygon_call(s->ctx, pc[0], pc[1], pc[2], pc[3], colors, s->p, s->a, s->commands,
+                                             s->keys, s->reserved, s->used, s->light);
         else
         {
             jo_3d_grow_borders(pc, grown, borders);
-            result = jo_3d_emit_polygon_call(s->ctx, &grown[0], &grown[1], &grown[2], &grown[3], colors, s->p, s->a, s->commands,
-                                        s->keys, s->reserved, s->used, s->light);
+            result = s->fast ? jo_3d_emit_part(s, &grown[0], &grown[1], &grown[2], &grown[3], colors) :
+                     jo_3d_emit_polygon_call(s->ctx, &grown[0], &grown[1], &grown[2], &grown[3], colors, s->p, s->a, s->commands,
+                                             s->keys, s->reserved, s->used, s->light);
         }
     }
     else
@@ -4860,6 +5006,35 @@ static  __attribute__((noinline)) void      jo_3d_subdivision_row_colors(unsigne
     }
 }
 
+/** @brief The points of a row of a subdivided polygon, one coordinate: from start to start + d at i x step, step = 1 / n
+ *  (n: 2 or 4), the same values as start + jo_fixed_mult(d, i x step) without the products
+ *  @param row The n + 1 points of the row (output: the coordinate k)
+ *  @remarks jo_fixed_mult(d, i x JO_FIXED_1 / 4) is d x i / 4 rounded down (the 64 bits product is exact): d >> 2 (shifted
+ *  as a signed value: rounded down), d >> 1, d - ceil(d / 4) (d - (d >> 2) - 1 when d is not a multiple of 4), d. In the
+ *  big jo_3d_emit_subdivided_polygon(), the compiler made 64 bits sums of the products, kept on the stack: about 30
+ *  instructions a point
+ */
+static  __jo_force_inline void              jo_3d_subdivision_row_coordinate(jo_fixed (* const row)[3], const int k, const jo_fixed start,
+                                                                             const jo_fixed d, const int n)
+{
+    jo_fixed                                quarter;
+
+    row[0][k] = start;
+    if (n == 4)
+    {
+        quarter = d >> 2;
+        row[1][k] = start + quarter;
+        row[2][k] = start + (d >> 1);
+        row[3][k] = start + (d - quarter - ((d & 3) != 0 ? 1 : 0));
+        row[4][k] = start + d;
+    }
+    else
+    {
+        row[1][k] = start + (d >> 1);
+        row[2][k] = start + d;
+    }
+}
+
 /** @brief Draw a textured polygon near the camera in n x n parts, each part with its tile of the texture: the distortion
  *  of the texture (the VDP1 maps it without perspective) and of the clipping by the near plane stays small, the parts
  *  are sorted with their own depth
@@ -4886,7 +5061,6 @@ static bool                                 jo_3d_emit_subdivided_polygon(jo_3d_
     unsigned short                          part_colors[4];
     jo_fixed                                view[4][3];
     jo_fixed                                step;
-    jo_fixed                                u;
     jo_fixed                                t;
     jo_fixed                                top[3];
     jo_fixed                                bottom_edge[3];
@@ -4905,6 +5079,9 @@ static bool                                 jo_3d_emit_subdivided_polygon(jo_3d_
     bool                                    fine;
     unsigned int                            any;
     const jo_texture_definition             *texture;
+    unsigned char                           parts[4 * 4];
+    int                                     visible;
+    int                                     m;
     int                                     th;
     int                                     i;
     int                                     j;
@@ -4984,13 +5161,9 @@ static bool                                 jo_3d_emit_subdivided_polygon(jo_3d_
             top[k] = view[0][k] + jo_fixed_mult(view[3][k] - view[0][k], t);
             bottom_edge[k] = view[1][k] + jo_fixed_mult(view[2][k] - view[1][k], t);
         }
-        for (JO_ZERO(i); i <= n; ++i)
-        {
-            u = step * i;
-            grid_view[j][i][0] = top[0] + jo_fixed_mult(bottom_edge[0] - top[0], u);
-            grid_view[j][i][1] = top[1] + jo_fixed_mult(bottom_edge[1] - top[1], u);
-            grid_view[j][i][2] = top[2] + jo_fixed_mult(bottom_edge[2] - top[2], u);
-        }
+        // (between the edges at i x step: see jo_3d_subdivision_row_coordinate())
+        for (JO_ZERO(k); k < 3; ++k)
+            jo_3d_subdivision_row_coordinate(grid_view[j], k, top[k], bottom_edge[k] - top[k], n);
         if (gouraud)
             jo_3d_subdivision_row_colors(colors[j], table, flat, t, step, n, j);
         // The corners of the polygon (projected): their positions on the screen as they are, the same as for the polygons next
@@ -5039,6 +5212,9 @@ static bool                                 jo_3d_emit_subdivided_polygon(jo_3d_
     s.tiles = &__jo_3d_tiles[a->texture_id];
     s.mirrored = mirrored;
     s.triangle = v[3] == v[2];
+    // (the usual parts: see jo_3d_emit_part(). The key of the whole polygon set above: JO_3D_SORT_MIN, JO_3D_SORT_MAX)
+    s.fast = !ctx->mirror && ctx->front_shift < 0 && a->plane == JO_3D_SINGLE_PLANE && (a->sort & JO_3D_USE_TEXTURE) && !jo_3d_is_lit(a) &&
+             (ctx->forced_key >= 0 || (a->sort & JO_3D_SORT_MASK) == JO_3D_SORT_CENTER);
     // Tiles: the back face of a dual plane polygon is mirrored (see jo_3d_emit_polygon()), the flips (horizontal: 0x10,
     // vertical: 0x20, see JO_VDP1_DIRECTION_FLIP_MASK)
     s.flip_x = mirrored != ((a->direction & 0x10) != 0);
@@ -5065,45 +5241,64 @@ static bool                                 jo_3d_emit_subdivided_polygon(jo_3d_
 #ifdef JO_TEST_SUBDIVISION_COUNT
     k = (int)*used;
 #endif
-    for (JO_ZERO(j); j < n && result; ++j)
-        for (JO_ZERO(i); i < n && result; ++i)
+    // The parts to draw first: a part outside of a side of the screen or behind the near plane has nothing to draw (the test of
+    // jo_3d_emit_tile(), without its call). In a list (row x 8 + column), from a loop of the codes of the points alone: about
+    // half of the parts of the polygons near the camera are out (under the screen, behind the camera), each one cost 130
+    // cycles in the loop of the parts drawn (its registers on the stack)
+    JO_ZERO(visible);
+    for (JO_ZERO(j); j < n; ++j)
+    {
+        const jo_3d_vertex                  *upper;
+        const jo_3d_vertex                  *lower;
+        unsigned int                        left_codes;
+        unsigned int                        right_codes;
+
+        upper = grid[j];
+        lower = grid[j + 1];
+        left_codes = (unsigned int)(upper[0].zc & lower[0].zc);
+        for (JO_ZERO(i); i < n; ++i)
         {
-            corners[0] = &grid[j][i];
-            corners[1] = &grid[j][i + 1];
-            corners[2] = &grid[j + 1][i + 1];
-            corners[3] = &grid[j + 1][i];
-            // A part outside of a side of the screen or behind the near plane: nothing to draw (the test of jo_3d_emit_tile(),
-            // without its call)
-            if ((unsigned int)(corners[0]->zc & corners[1]->zc & corners[2]->zc & corners[3]->zc) & JO_3D_CODE_MASK &
-                (JO_3D_CODE_SCREEN | JO_3D_CODE_NEAR))
-                continue;
-            // (the positions in the view space are read only by a part that crosses the near plane or goes far outside of
-            // the screen, see jo_3d_emit_tile())
-            any = (unsigned int)(corners[0]->zc | corners[1]->zc | corners[2]->zc | corners[3]->zc) & JO_3D_CODE_MASK;
-            if (gouraud)
-            {
-                part_colors[0] = colors[j][i];
-                part_colors[1] = colors[j][i + 1];
-                part_colors[2] = colors[j + 1][i + 1];
-                part_colors[3] = colors[j + 1][i];
-            }
-            // (most parts: drawn here, no call of the recursive jo_3d_emit_tile(); the finer tiles: the parts cut again too,
-            // see jo_3d_fine_part())
-            if (!(any & (JO_3D_CODE_NEAR | JO_3D_CODE_GUARD)) && (!fine || n != 4 || !jo_3d_fine_part(&s, corners, any)))
-            {
-                result = jo_3d_emit_tile_part(&s, (const jo_fixed (*)[3])corner_view, corners, gouraud ? part_colors : JO_NULL, n == 4 ? 1 : 0,
-                                              i, j, 0, any);
-                continue;
-            }
-            for (JO_ZERO(k); k < 3; ++k)
-            {
-                corner_view[0][k] = grid_view[j][i][k];
-                corner_view[1][k] = grid_view[j][i + 1][k];
-                corner_view[2][k] = grid_view[j + 1][i + 1][k];
-                corner_view[3][k] = grid_view[j + 1][i][k];
-            }
-            result = jo_3d_emit_tile(&s, (const jo_fixed (*)[3])corner_view, corners, gouraud ? part_colors : JO_NULL, n == 4 ? 1 : 0, i, j, 0);
+            right_codes = (unsigned int)(upper[i + 1].zc & lower[i + 1].zc);
+            if (!(left_codes & right_codes & (JO_3D_CODE_SCREEN | JO_3D_CODE_NEAR)))
+                parts[visible++] = (unsigned char)(JO_MULT_BY_8(j) + i);
+            left_codes = right_codes;
         }
+    }
+    for (JO_ZERO(m); m < visible && result; ++m)
+    {
+        j = parts[m] >> 3;
+        i = parts[m] & 7;
+        corners[0] = &grid[j][i];
+        corners[1] = &grid[j][i + 1];
+        corners[2] = &grid[j + 1][i + 1];
+        corners[3] = &grid[j + 1][i];
+        // (the positions in the view space are read only by a part that crosses the near plane or goes far outside of
+        // the screen, see jo_3d_emit_tile())
+        any = (unsigned int)(corners[0]->zc | corners[1]->zc | corners[2]->zc | corners[3]->zc) & JO_3D_CODE_MASK;
+        if (gouraud)
+        {
+            part_colors[0] = colors[j][i];
+            part_colors[1] = colors[j][i + 1];
+            part_colors[2] = colors[j + 1][i + 1];
+            part_colors[3] = colors[j + 1][i];
+        }
+        // (most parts: drawn here, no call of the recursive jo_3d_emit_tile(); the finer tiles: the parts cut again too,
+        // see jo_3d_fine_part())
+        if (!(any & (JO_3D_CODE_NEAR | JO_3D_CODE_GUARD)) && (!fine || n != 4 || !jo_3d_fine_part(&s, corners, any)))
+        {
+            result = jo_3d_emit_tile_part(&s, (const jo_fixed (*)[3])corner_view, corners, gouraud ? part_colors : JO_NULL, n == 4 ? 1 : 0,
+                                          i, j, 0, any);
+            continue;
+        }
+        for (JO_ZERO(k); k < 3; ++k)
+        {
+            corner_view[0][k] = grid_view[j][i][k];
+            corner_view[1][k] = grid_view[j][i + 1][k];
+            corner_view[2][k] = grid_view[j + 1][i + 1][k];
+            corner_view[3][k] = grid_view[j + 1][i][k];
+        }
+        result = jo_3d_emit_tile(&s, (const jo_fixed (*)[3])corner_view, corners, gouraud ? part_colors : JO_NULL, n == 4 ? 1 : 0, i, j, 0);
+    }
     // The polygon after this one sorted with it (JO_3D_SORT_PREVIOUS: a picture on a wall) is drawn after all its parts: the
     // key of its nearest vertex (the parts are sorted on their centers: all farther. With the key of the last part, the
     // parts nearer than it were drawn over the picture)
@@ -5327,6 +5522,11 @@ void                                        jo_3d_set_texture_subdivision_depth(
 {
     if (sprite_id >= 0 && sprite_id < JO_MAX_SPRITE)
         __jo_3d_tiles[sprite_id].depth = depth;
+}
+
+void                                        jo_3d_set_fewer_parts(const bool enabled)
+{
+    *(volatile bool *)JO_CACHE_THROUGH(&__jo_3d_fewer_parts) = enabled;
 }
 
 void                                        jo_3d_set_texture_subdivision_error(const int sprite_id, const int pixels)
@@ -5644,14 +5844,12 @@ static bool                                 jo_3d_draw_polygon_general(const jo_
 static unsigned int                         jo_3d_environment_tile(jo_3d_draw_state * const s, const jo_3d_polygon * const p)
 {
     const jo_3d_environment                 *e;
-    const jo_texture_definition             *texture;
     jo_fixed                                (*m)[3];
     jo_fixed                                length;
     jo_fixed                                u;
     jo_fixed                                v;
     int                                     i;
     int                                     j;
-    int                                     th;
     int                                     k;
 
     e = &__jo_3d_environments[s->ctx->environment];
@@ -5685,10 +5883,9 @@ static unsigned int                         jo_3d_environment_tile(jo_3d_draw_st
     j = (int)(((long long)(v + JO_FIXED_1) * e->tiles) >> 17);
     i = JO_MIN(JO_MAX(i, 0), e->tiles - 1);
     j = JO_MIN(JO_MAX(j, 0), e->tiles - 1);
-    texture = &__jo_sprite_def[e->sprite];
-    th = texture->height / (e->tiles * e->tiles);
-    return (((unsigned int)(texture->adr + JO_DIV_BY_8((j * e->tiles + i) * th * JO_MULT_BY_2(texture->width))) << 16) |
-            ((unsigned int)JO_DIV_BY_8(texture->width) << 8) | (unsigned int)th);
+    // (the step and the size of a tile: computed once, a division per polygon was 6 % of the time of the CPU in the
+    // environment mapping demo)
+    return (((__jo_sprite_def[e->sprite].adr + (unsigned int)(j * e->tiles + i) * e->tile_step) << 16) | e->tile_size);
 }
 
 /** @brief The normal of each polygon of a mesh (unit vectors: the cross product of its diagonals) */
@@ -5746,6 +5943,14 @@ static void                                 jo_3d_compute_mesh_normals(jo_3d_mes
     }
 }
 
+static bool                                 jo_3d_draw_environment_polygon(const jo_3d_polygon_loop * const k, const jo_3d_polygon * const p,
+                                                                           const jo_3d_polygon_attribute * const a);
+
+/** @brief Draw a polygon with the tile of the environment map (see __jo_3d_draw_polygon_slow()), set by
+ *  jo_3d_set_mesh_environment(): the code of the environment maps only in the programs that use them (about 1 KB) */
+static bool                                 (*__jo_3d_environment_polygon)(const jo_3d_polygon_loop * const k, const jo_3d_polygon * const p,
+                                                                           const jo_3d_polygon_attribute * const a) = JO_NULL;
+
 bool                                        jo_3d_set_mesh_environment(jo_3d_mesh * const mesh, const int sprite_id, const int tiles)
 {
     jo_3d_environment                       *e;
@@ -5796,10 +6001,14 @@ bool                                        jo_3d_set_mesh_environment(jo_3d_mes
     jo_free(img.data);
     if (id < 0)
         return (false);
+    __jo_3d_environment_polygon = jo_3d_draw_environment_polygon;
     e->key = &mesh->data;
     e->sprite = id;
     e->tiles = tiles;
     e->first_sprite = id;
+    // (tw is a multiple of 8: the step of the tiles in units of 8 bytes is exact)
+    e->tile_step = (unsigned int)JO_DIV_BY_8(th * JO_MULT_BY_2(tw));
+    e->tile_size = ((unsigned int)JO_DIV_BY_8(tw) << 8) | (unsigned int)th;
     jo_3d_count_environments();
     // The normals of the polygons: the tiles
     jo_3d_compute_mesh_normals(mesh);
@@ -5823,7 +6032,7 @@ bool                                        jo_3d_set_mesh_polygon_environment(j
     return (true);
 }
 
-/** @brief A polygon with the tile of the environment map upright on the screen (see __jo_3d_draw_polygon_slow())
+/** @brief A polygon with the tile of the environment map upright on the screen (see jo_3d_draw_environment_polygon())
  *  @param k Parameters of the loop
  *  @param p Polygon
  *  @param a Its attribute
@@ -5878,7 +6087,116 @@ static const jo_3d_polygon                  *jo_3d_environment_upright(const jo_
     return (upright);
 }
 
-/** @brief Draw one polygon: the general case (see __jo_3d_polygon_loop()), with the tile of the environment map
+/** @brief The fields read by jo_3d_emit_part() for the usual polygon of an environment map (see
+ *  jo_3d_draw_environment_polygon()), one per CPU, written for each polygon (not on the stack: the stack of the slave CPU is
+ *  small) */
+static jo_3d_subdivision                    __jo_3d_environment_part[2] __attribute__((aligned(16)));
+
+/** @brief Draw one polygon with the tile of the environment map (see __jo_3d_environment_polygon())
+ *  @param k Parameters of the loop
+ *  @param p Polygon
+ *  @param a Its attribute (textured by the tiles of the environment map)
+ *  @return false if the command table is full (or an index is invalid)
+ */
+static bool                                 jo_3d_draw_environment_polygon(const jo_3d_polygon_loop * const k, const jo_3d_polygon * const p,
+                                                                           const jo_3d_polygon_attribute * const a)
+{
+    jo_3d_cpu_context                       *ctx;
+    jo_3d_subdivision                       *part;
+    const jo_3d_polygon                     *q;
+    jo_3d_polygon                           upright;
+    jo_3d_vertex                            *drawn[4];
+    bool                                    result;
+    bool                                    fast;
+
+    ctx = k->state->ctx;
+    fast = false;
+    // A polygon that would not be drawn: skipped before its tile (the back faces of a closed mesh, half of its polygons: the
+    // tile, the upright vertices and the general path cost about 3 times the drawing of the front faces in the environment
+    // mapping demo). Back face: both of its triangles face away, for both of its diagonals (the vertices of the upright copy
+    // are rotated: the general path splits it along one or the other)
+    if (a->plane == JO_3D_SINGLE_PLANE && !ctx->mirror && p->vertices[0] < k->count && p->vertices[1] < k->count &&
+        p->vertices[2] < k->count && p->vertices[3] < k->count)
+    {
+        const jo_3d_vertex                  *v[4];
+        int                                 x[4];
+        int                                 y[4];
+        int                                 cross;
+        int                                 tri;
+        int                                 i;
+
+        for (JO_ZERO(i); i < 4; ++i)
+            v[i] = &k->vertices[p->vertices[i]];
+        if ((v[0]->zc & v[1]->zc & v[2]->zc & v[3]->zc) & (JO_3D_CODE_SCREEN | JO_3D_CODE_NEAR))
+            return (true);
+        if (((v[0]->zc | v[1]->zc | v[2]->zc | v[3]->zc) & JO_3D_CODE_MASK) == 0)
+        {
+            for (JO_ZERO(i); i < 4; ++i)
+            {
+                x[i] = JO_3D_VERTEX_X(v[i]);
+                y[i] = JO_3D_VERTEX_Y(v[i]);
+            }
+            // (the cross product of the diagonals: the sum of the areas x 2 of the triangles of either diagonal, clockwise,
+            // front, positive; then the triangles 0 1 2 and 1 2 3: the others are the sum minus them)
+            cross = (x[2] - x[0]) * (y[3] - y[1]) - (x[3] - x[1]) * (y[2] - y[0]);
+            if (cross < 0)
+            {
+                tri = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
+                if (tri < 0 && cross - tri < 0)
+                {
+                    tri = (x[2] - x[1]) * (y[3] - y[1]) - (y[2] - y[1]) * (x[3] - x[1]);
+                    if (tri < 0 && cross - tri < 0)
+                        return (true);
+                }
+            }
+            // The usual polygon: on the screen, one plane, not lit, sorted on its center, a texture without tiles and smaller
+            // copies (see jo_3d_subdivision.fast; jo_3d_draw_polygon_general(): not drawn in parts, not a thin line)
+            fast = k->clip_mode == 0 && ctx->front_shift < 0 && !jo_3d_is_lit(a) && __jo_3d_tiles[a->texture_id].levels == 0 &&
+                   __jo_sprite_mean_color[a->texture_id] == 0 && (ctx->forced_key >= 0 || (a->sort & JO_3D_SORT_MASK) == JO_3D_SORT_CENTER);
+        }
+    }
+    ctx->texture_words = jo_3d_environment_tile(k->state, p);
+    // The tile kept upright on the screen (a reflection doesn't turn with the polygon): its vertices rotated
+    q = jo_3d_environment_upright(k, p, a, &upright);
+    if (!fast)
+        result = jo_3d_draw_polygon_general(k, q, a);
+    else
+    {
+        // The usual polygon: the test of jo_3d_draw_polygon_general() left (too far), then the command of jo_3d_emit_part(),
+        // the same command as jo_3d_emit_polygon_call() without the general path and its 13 arguments (about 9 microseconds
+        // less per polygon, Mednafen)
+        drawn[0] = &k->vertices[q->vertices[0]];
+        drawn[1] = &k->vertices[q->vertices[1]];
+        drawn[2] = &k->vertices[q->vertices[2]];
+        drawn[3] = &k->vertices[q->vertices[3]];
+        if (JO_MIN(JO_MIN(drawn[0]->zc, drawn[1]->zc), JO_MIN(drawn[2]->zc, drawn[3]->zc)) > k->zlimit)
+            result = true;
+        else
+        {
+#ifdef JO_TEST_PATH_COUNTS
+            // (see jo_3d_draw_polygon_general(): drawn as one polygon, no tiles)
+            JO_SUB_REASON(7);
+            ++__jo_3d_path_counts[ctx->slave ? 4 : 0][0];
+            if (!ctx->slave)
+                ++__jo_3d_path_reasons[__jo_3d_sub_reason & 7];
+#endif
+            part = &__jo_3d_environment_part[ctx->slave ? 1 : 0];
+            part->ctx = ctx;
+            part->p = q;
+            part->a = a;
+            part->commands = k->commands;
+            part->keys = k->keys;
+            part->reserved = k->reserved;
+            part->used = k->used;
+            part->light = k->state->light;
+            result = jo_3d_emit_part(part, drawn[0], drawn[1], drawn[2], drawn[3], JO_NULL);
+        }
+    }
+    ctx->texture_words = 0;
+    return (result);
+}
+
+/** @brief Draw one polygon: the general case (see __jo_3d_polygon_loop()), or with the tile of the environment map
  *  @param k Parameters of the loop
  *  @param p Polygon
  *  @param a Its attribute
@@ -5889,17 +6207,13 @@ bool __attribute__((noinline, used, externally_visible)) __jo_3d_draw_polygon_sl
                                                                       const jo_3d_polygon_attribute * const a)
 {
     jo_3d_cpu_context                       *ctx;
-    jo_3d_polygon                           upright;
-    bool                                    result;
 
     ctx = k->state->ctx;
-    if (ctx->environment < 0 || !(a->sort & JO_3D_USE_TEXTURE) || a->texture_id != __jo_3d_environments[ctx->environment].sprite)
+    // (an environment map: after jo_3d_set_mesh_environment(), see __jo_3d_environment_polygon)
+    if (ctx->environment < 0 || !(a->sort & JO_3D_USE_TEXTURE) || a->texture_id != __jo_3d_environments[ctx->environment].sprite ||
+        __jo_3d_environment_polygon == JO_NULL)
         return (jo_3d_draw_polygon_general(k, p, a));
-    ctx->texture_words = jo_3d_environment_tile(k->state, p);
-    // The tile kept upright on the screen (a reflection doesn't turn with the polygon): its vertices rotated
-    result = jo_3d_draw_polygon_general(k, jo_3d_environment_upright(k, p, a, &upright), a);
-    ctx->texture_words = 0;
-    return (result);
+    return (__jo_3d_environment_polygon(k, p, a));
 }
 
 /** @brief Light the command of a polygon written by the assembly loop (as jo_3d_emit_polygon() does after the command)
@@ -6813,7 +7127,7 @@ __asm__(
  */
 
 static bool                                 jo_3d_draw_polygons(jo_3d_cpu_context * const ctx, const jo_3d_polygon_data * const pdata,
-                                                                const unsigned int point_count,
+                                                                const unsigned int first_point, const unsigned int point_count,
                                                                 const jo_3d_polygon_range * const ranges, const int range_count,
                                                                 const int window, jo_vdp1_command * const commands,
                                                                 unsigned short * const keys, const unsigned int reserved,
@@ -6885,8 +7199,8 @@ static bool                                 jo_3d_draw_polygons(jo_3d_cpu_contex
     clip.planes[2] = 0;
     clip.planes[3] = 0;
     jo_profile_begin(JO_PROFILE_3D_VERTICES);
-    if (ctx->parts == JO_NULL && ranges != JO_NULL && count > 0 && JO_MULT_BY_8(polygon_count) <= pdata->polygon_count * 7 &&
-        point_count >= pdata->point_count)
+    if (ctx->parts == JO_NULL && (first_point > 0 || (ranges != JO_NULL && count > 0 && JO_MULT_BY_8(polygon_count) <= pdata->polygon_count * 7 &&
+        point_count >= pdata->point_count)))
     {
         // A few polygons of the mesh (half of them at most: a part of a cell, the share of a CPU): only the vertices from the
         // first one they use to the last one (the vertices of a model are in the order of its polygons: the 2 CPUs drew
@@ -6904,6 +7218,15 @@ static bool                                 jo_3d_draw_polygons(jo_3d_cpu_contex
 
         lo = count;
         JO_ZERO(hi);
+        // (the first point given by the caller: the points of its ranges known (the chunks of the cells, see
+        // __jo_3d_draw_ranges_from()), not searched: the search read the 4 vertex indexes of each polygon, out of the cache,
+        // 2 % of the time of each CPU in the first person shooter demo)
+        if (first_point > 0)
+        {
+            lo = first_point;
+            hi = count - 1;
+        }
+        else
         for (JO_ZERO(i); range + i < last_range; ++i)
             for (q = pdata->polygons + range[i].first, q_end = q + range[i].count; q < q_end; ++q)
             {
@@ -7344,6 +7667,13 @@ bool                                        __jo_3d_draw_parts(const jo_3d_polyg
 bool                                        __jo_3d_draw_ranges(const jo_3d_polygon_data * const pdata, const unsigned int point_count,
                                                                 const jo_3d_polygon_range * const ranges, const int range_count)
 {
+    return (__jo_3d_draw_ranges_from(pdata, 0, point_count, ranges, range_count));
+}
+
+bool                                        __jo_3d_draw_ranges_from(const jo_3d_polygon_data * const pdata, const unsigned int first_point,
+                                                                     const unsigned int point_count,
+                                                                     const jo_3d_polygon_range * const ranges, const int range_count)
+{
     jo_vdp1_command                         *commands;
     unsigned short                          *keys;
     unsigned int                            reserved;
@@ -7353,7 +7683,7 @@ bool                                        __jo_3d_draw_ranges(const jo_3d_poly
     __jo_3d_master.matrix = JO_3D_CURRENT_MATRIX;
     commands = __jo_vdp1_reserve_commands(JO_3D_RESERVE_ALL_COMMANDS, &keys, &reserved);
     JO_ZERO(used);
-    result = jo_3d_draw_polygons(&__jo_3d_master, pdata, point_count, ranges, range_count, __jo_vdp1_current_window, commands, keys,
+    result = jo_3d_draw_polygons(&__jo_3d_master, pdata, first_point, point_count, ranges, range_count, __jo_vdp1_current_window, commands, keys,
                                  reserved, &used);
     // (when the command table is full, the commands were committed by jo_3d_emit_polygon())
     if (result)
@@ -7443,6 +7773,94 @@ static  __jo_force_inline bool              jo_3d_standing_sprite_points(const j
     return (true);
 }
 
+/*
+** Fade of the far standing sprites (see jo_3d_set_sprite_fade()): their 16 colors in a bank of the color RAM, the color
+** calculation bits of the sprites (bits 12 and 11 of a palette pixel, sprite type 3) give the ratio of their mix with the
+** screens of the VDP2 under them, by distance. The VDP2 mixes each pixel once, at the display: no edge, no line drawn twice
+*/
+
+/** @brief The distances of the fade: its start and the step of a level (jo_fixed, the step 0: no fade) */
+typedef struct
+{
+    jo_fixed                                start;
+    jo_fixed                                levels_per_unit;
+}                                           jo_3d_fade;
+
+static jo_3d_fade                           __jo_3d_fade = {0, 0};
+
+/** @brief The fade of a range of distances (see jo_3d_set_fade_distances()) */
+static void                                 jo_3d_fade_set(jo_3d_fade * const fade, const jo_fixed start, const jo_fixed end)
+{
+    fade->start = start;
+    // (JO_3D_FADE_LEVELS levels from start to end: the level of a depth is 1 + its distance after start times this)
+    fade->levels_per_unit = end > start ? jo_fixed_div(jo_int2fixed(JO_3D_FADE_LEVELS), end - start) : 0;
+}
+
+void                                        jo_3d_set_fade_distances(const jo_fixed start, const jo_fixed end)
+{
+    jo_3d_fade_set(&__jo_3d_fade, start, end);
+}
+
+bool                                        jo_3d_set_sprite_fade(const int sprite_id, const jo_palette * const palette, const int bank)
+{
+    int                                     k;
+    int                                     n;
+    const unsigned short                    *lut;
+
+    if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE)
+        return (false);
+    // (the sprite forgotten: its bank 0)
+    for (JO_ZERO(k); k < __jo_3d_fade_sprite_count && __jo_3d_fade_sprites[k].sprite != sprite_id; ++k)
+        ;
+    if (palette == JO_NULL || palette->data == JO_NULL || bank <= 0)
+    {
+        if (k < __jo_3d_fade_sprite_count)
+            __jo_3d_fade_sprites[k] = __jo_3d_fade_sprites[--__jo_3d_fade_sprite_count];
+        return (true);
+    }
+    // A 16 colors texture with its table only (its colors copied in the bank)
+    if (__jo_sprite_pic[sprite_id].color_mode != JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS || __jo_sprite_lut[sprite_id] == 0 ||
+        bank >= 16 || (k >= __jo_3d_fade_sprite_count && __jo_3d_fade_sprite_count >= JO_3D_FADE_SPRITES))
+        return (false);
+    // (the color c of the bank is the color index bank * 16 + c of the palette: its data[bank * 16 + c - 1], see
+    // jo_create_palette(); the color 0 is transparent, not written)
+    lut = (const unsigned short *)(JO_VDP1_VRAM + JO_MULT_BY_8(__jo_sprite_lut[sprite_id]));
+    for (n = 1; n < 16; ++n)
+        palette->data[bank * 16 + n - 1] = lut[n];
+    if (k >= __jo_3d_fade_sprite_count)
+        ++__jo_3d_fade_sprite_count;
+    __jo_3d_fade_sprites[k].sprite = (short)sprite_id;
+    __jo_3d_fade_sprites[k].bank = (unsigned short)(palette->id * 256 + bank * 16);
+    return (true);
+}
+
+/** @brief The attribute of a standing sprite that fades: its colors in their bank, the level of its depth (see
+ *  jo_3d_set_sprite_fade())
+ *  @param sprite_id The sprite (not its smaller copy: the attribute has its texture)
+ *  @param z Depth of the sprite
+ */
+static  __jo_force_inline void              jo_3d_fade_attribute(jo_vdp1_sprite_attribute * const attr, const jo_3d_fade * const fade,
+                                                                 const int sprite_id, const jo_fixed z)
+{
+    int                                     k;
+    int                                     level;
+
+    if (fade->levels_per_unit == 0 || z <= fade->start || __jo_3d_fade_sprite_count == 0 || __jo_screen.hires)
+        return;
+    for (JO_ZERO(k); k < __jo_3d_fade_sprite_count; ++k)
+        if (__jo_3d_fade_sprites[k].sprite == sprite_id)
+            break;
+    if (k >= __jo_3d_fade_sprite_count)
+        return;
+    level = 1 + jo_fixed2int(jo_fixed_mult(z - fade->start, fade->levels_per_unit));
+    if (level > JO_3D_FADE_LEVELS)
+        level = JO_3D_FADE_LEVELS;
+    // (a palette pixel: no gouraud, the VDP1 shades the RGB pixels only)
+    attr->draw_mode = (unsigned short)((attr->draw_mode & ~(JO_VDP1_COLOR_MODE_MASK | JO_VDP1_COLOR_CALC_GOURAUD)) |
+                                       JO_VDP1_COLOR_MODE_16_BANK);
+    attr->color = (unsigned short)(__jo_3d_fade_sprites[k].bank | (level << JO_3D_FADE_LEVEL_SHIFT));
+}
+
 #ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
 
 /*
@@ -7472,6 +7890,8 @@ static unsigned short                       __jo_3d_slave_vertice_count;
 static unsigned short                       __jo_3d_slave_displayed_polygon_count;
 /** @brief The sprite attributes of the master CPU at jo_3d_slave_begin() (it changes them while the slave CPU draws) */
 static jo_sprite_attributes                 __jo_3d_slave_sprite_attributes;
+/** @brief The fade of the standing sprites of the slave CPU (the one of the master CPU at jo_3d_slave_begin()) */
+static jo_3d_fade                           __jo_3d_slave_fade;
 static jo_3d_cpu_context                    __jo_3d_slave = {__jo_3d_slave_vertices, JO_3D_SLAVE_MAX_VERTICES, __jo_3d_slave_view, __jo_3d_slave_matrix[0], 0, -1,
                                                              &__jo_3d_slave_depth_bias, 0, 0, JO_3D_CLIP_GOURAUD_TABLES,
                                                              &__jo_3d_slave_polygon_count, &__jo_3d_slave_vertice_count,
@@ -7503,6 +7923,7 @@ void                                        jo_3d_slave_begin(void)
     __jo_3d_slave_window = __jo_vdp1_current_window;
     __jo_3d_slave_view_rect = __jo_3d_view_rect;
     __jo_3d_slave_sprite_attributes = __jo_sprite_attributes;
+    __jo_3d_slave_fade = __jo_3d_fade;
     __jo_3d_slave.previous_polygon_z = 0;
     __jo_3d_slave.forced_key = -1;
     __jo_3d_slave_tint = 0;
@@ -7533,6 +7954,11 @@ void                                        jo_3d_slave_select_window(const int 
 void                                        jo_3d_slave_set_depth_bias(const int bias)
 {
     __jo_3d_slave_depth_bias = bias;
+}
+
+void                                        jo_3d_slave_set_fade_distances(const jo_fixed start, const jo_fixed end)
+{
+    jo_3d_fade_set(&__jo_3d_slave_fade, start, end);
 }
 
 void                                        jo_3d_slave_set_guard_band(const int pixels)
@@ -7597,11 +8023,18 @@ void                                        jo_3d_slave_set_scale_fixed(const jo
 bool                                        jo_3d_slave_mesh_draw_ranges(const jo_3d_mesh * const mesh, const unsigned int point_count,
                                                                          const jo_3d_polygon_range * const ranges, const int range_count)
 {
+    return (__jo_3d_slave_draw_ranges_from(mesh, 0, point_count, ranges, range_count));
+}
+
+bool                                        __jo_3d_slave_draw_ranges_from(const jo_3d_mesh * const mesh, const unsigned int first_point,
+                                                                           const unsigned int point_count,
+                                                                           const jo_3d_polygon_range * const ranges, const int range_count)
+{
     unsigned int                            used;
     bool                                    result;
 
     used = __jo_3d_slave_command_count;
-    result = jo_3d_draw_polygons(&__jo_3d_slave, &mesh->data, point_count, ranges, range_count, __jo_3d_slave_window,
+    result = jo_3d_draw_polygons(&__jo_3d_slave, &mesh->data, first_point, point_count, ranges, range_count, __jo_3d_slave_window,
                                  __jo_3d_slave_commands, __jo_3d_slave_keys, JO_3D_SLAVE_MAX_COMMANDS, &used);
     __jo_3d_slave_command_count = used;
     return (result);
@@ -7627,6 +8060,7 @@ bool                                        jo_3d_slave_draw_standing_sprite(con
     // Far away: a smaller copy of the texture. The command of jo_3d_draw_standing_sprite() (the sprite attributes of the
     // master CPU at jo_3d_slave_begin()), with the window and the depth bias of the slave CPU
     __jo_sprite_attributes_of(&attr, jo_3d_mipmap(sprite_id, w, h), &__jo_3d_slave_sprite_attributes);
+    jo_3d_fade_attribute(&attr, &__jo_3d_slave_fade, sprite_id, v.z);
     if (!__jo_vdp1_write_sprite_4p(&__jo_3d_slave_commands[__jo_3d_slave_command_count], points, v.z, &attr, __jo_3d_slave_window))
         return (false);
     key = JO_FIXED_TO_INT(v.z) + __jo_3d_slave_depth_bias;
@@ -7643,7 +8077,7 @@ bool                                        __jo_3d_slave_draw_parts(const jo_3d
     __jo_3d_slave.parts = parts;
     __jo_3d_slave.part_count = part_count;
     used = __jo_3d_slave_command_count;
-    result = jo_3d_draw_polygons(&__jo_3d_slave, pdata, pdata->point_count, JO_NULL, 0, __jo_3d_slave_window,
+    result = jo_3d_draw_polygons(&__jo_3d_slave, pdata, 0, pdata->point_count, JO_NULL, 0, __jo_3d_slave_window,
                                  __jo_3d_slave_commands, __jo_3d_slave_keys, JO_3D_SLAVE_MAX_COMMANDS, &used);
     __jo_3d_slave_command_count = used;
     __jo_3d_slave.parts = JO_NULL;
@@ -8021,6 +8455,24 @@ void                        jo_3d_create_cube(jo_3d_quad * const array, jo_verti
     jo_3d_create_plane(array + 5, vertices + 20);
 }
 
+/** @brief Draw mode options kept when the texture, the color or the wireframe mode of a polygon changes
+ *  @param attribute Attribute of the polygon
+ *  @param textured The new polygon is textured (the high speed shrink only applies to the textures)
+ *  @return The screen doors, the half transparency and the high speed shrink of the polygon (lost before: only the screen
+ *          doors were kept, a jo_3d_set_mesh_transparency() before a jo_3d_set_mesh_texture() was lost)
+ */
+static unsigned short       jo_3d_kept_draw_mode(const jo_3d_polygon_attribute * const attribute, const bool textured)
+{
+    unsigned short          kept;
+
+    kept = attribute->draw_mode & JO_VDP1_MESH;
+    if ((attribute->draw_mode & 7) == JO_VDP1_COLOR_CALC_HALF_TRANSPARENT)
+        kept |= JO_VDP1_COLOR_CALC_HALF_TRANSPARENT;
+    if (textured)
+        kept |= attribute->draw_mode & JO_VDP1_HIGH_SPEED_SHRINK;
+    return (kept);
+}
+
 void                        jo_3d_set_mesh_polygon_transparency(jo_3d_mesh * const mesh, const bool enabled, const unsigned int index)
 {
 #ifdef JO_DEBUG
@@ -8165,7 +8617,7 @@ void                        jo_3d_set_mesh_light(jo_3d_mesh * const mesh, const 
 void                        jo_3d_set_mesh_polygon_texture(jo_3d_mesh * const mesh, const int sprite_id, const unsigned int index)
 {
     bool                    use_light;
-    bool                    use_screen_doors;
+    unsigned short          kept;
 
 #ifdef JO_DEBUG
     if (mesh == JO_NULL)
@@ -8180,7 +8632,7 @@ void                        jo_3d_set_mesh_polygon_texture(jo_3d_mesh * const me
     }
 #endif
     use_light = (mesh->data.attributes[index].sort & JO_3D_USE_LIGHT) != 0;
-    use_screen_doors = (mesh->data.attributes[index].draw_mode & JO_VDP1_MESH) != 0;
+    kept = jo_3d_kept_draw_mode(&mesh->data.attributes[index], true);
     mesh->data.attributes[index].sort = JO_3D_SORT_CENTER | JO_VDP1_DIRECTION_OPTIONS(JO_VDP1_SPRITE_NO_FLIP) | JO_3D_NO_OPTION;
     if (use_light)
         JO_ADD_FLAG(mesh->data.attributes[index].sort, JO_3D_USE_LIGHT);
@@ -8207,8 +8659,7 @@ void                        jo_3d_set_mesh_polygon_texture(jo_3d_mesh * const me
         mesh->data.attributes[index].color = JO_VDP1_NO_PALETTE;
         mesh->data.attributes[index].draw_mode = (JO_VDP1_COLOR_MODE_RGB | JO_VDP1_NO_GOURAUD) | JO_VDP1_DIRECTION_DRAW_MODE(JO_VDP1_SPRITE_NO_FLIP);
     }
-    if (use_screen_doors)
-        JO_ADD_FLAG(mesh->data.attributes[index].draw_mode, JO_VDP1_MESH);
+    JO_ADD_FLAG(mesh->data.attributes[index].draw_mode, kept);
     mesh->data.attributes[index].direction = JO_VDP1_DIRECTION_COMMAND(JO_VDP1_SPRITE_NO_FLIP);
 }
 
@@ -8229,22 +8680,14 @@ void                        jo_3d_set_mesh_texture(jo_3d_mesh * const mesh, cons
 
 void                        jo_3d_set_mesh_polygon_wireframe(jo_3d_mesh * const mesh, const unsigned int index, bool wireframe)
 {
-#ifdef JO_DEBUG
-    if (mesh == JO_NULL)
-    {
-        jo_core_error("mesh is null");
-        return ;
-    }
-#endif
-    mesh->data.attributes[index].sort = JO_3D_SORT_CENTER | JO_VDP1_DIRECTION_OPTIONS(wireframe ? JO_VDP1_POLYLINE : JO_VDP1_POLYGON) | JO_3D_NO_OPTION;
-    mesh->data.attributes[index].draw_mode = (JO_VDP1_COLOR_MODE_RGB | JO_VDP1_NO_GOURAUD) | JO_VDP1_DIRECTION_DRAW_MODE(wireframe ? JO_VDP1_POLYLINE : JO_VDP1_POLYGON);
-    mesh->data.attributes[index].direction = JO_VDP1_DIRECTION_COMMAND(wireframe ? JO_VDP1_POLYLINE : JO_VDP1_POLYGON);
+    // (the color of the polygon, its light, screen doors and half transparency kept, see jo_3d_set_mesh_polygon_color_ex())
+    jo_3d_set_mesh_polygon_color_ex(mesh, mesh->data.attributes[index].color, index, wireframe);
 }
 
 void                        jo_3d_set_mesh_polygon_color_ex(jo_3d_mesh * const mesh, const jo_color color, const unsigned int index, bool wireframe)
 {
     bool                    use_light;
-    bool                    use_screen_doors;
+    unsigned short          kept;
 
 #ifdef JO_DEBUG
     if (mesh == JO_NULL)
@@ -8259,14 +8702,13 @@ void                        jo_3d_set_mesh_polygon_color_ex(jo_3d_mesh * const m
     }
 #endif
     use_light = (mesh->data.attributes[index].sort & JO_3D_USE_LIGHT) != 0;
-    use_screen_doors = (mesh->data.attributes[index].draw_mode & JO_VDP1_MESH) != 0;
+    kept = jo_3d_kept_draw_mode(&mesh->data.attributes[index], false);
     mesh->data.attributes[index].sort = JO_3D_SORT_CENTER | JO_VDP1_DIRECTION_OPTIONS(wireframe ? JO_VDP1_POLYLINE : JO_VDP1_POLYGON) | JO_3D_NO_OPTION;
     if (use_light)
         JO_ADD_FLAG(mesh->data.attributes[index].sort, JO_3D_USE_LIGHT);
     mesh->data.attributes[index].texture_id = JO_3D_NO_TEXTURE;
     mesh->data.attributes[index].draw_mode = (JO_VDP1_COLOR_MODE_RGB | JO_VDP1_NO_GOURAUD) | JO_VDP1_DIRECTION_DRAW_MODE(wireframe ? JO_VDP1_POLYLINE : JO_VDP1_POLYGON);
-    if (use_screen_doors)
-        JO_ADD_FLAG(mesh->data.attributes[index].draw_mode, JO_VDP1_MESH);
+    JO_ADD_FLAG(mesh->data.attributes[index].draw_mode, kept);
     mesh->data.attributes[index].color = color;
     mesh->data.attributes[index].direction = JO_VDP1_DIRECTION_COMMAND(wireframe ? JO_VDP1_POLYLINE : JO_VDP1_POLYGON);
 }
@@ -8393,7 +8835,9 @@ int                                         jo_3d_mesh_get_bounding_sphere(const
     center->y = jo_int2fixed((lo[1] + hi[1]) / 2);
     center->z = jo_int2fixed((lo[2] + hi[2]) / 2);
     // (the half sizes: 3 x 32767^2 fits in 32 bits, the whole sizes overflowed for the meshes bigger than about 37000)
-    return (jo_sqrt((unsigned int)(JO_SQUARE((hi[0] - lo[0] + 1) / 2) + JO_SQUARE((hi[1] - lo[1] + 1) / 2) + JO_SQUARE((hi[2] - lo[2] + 1) / 2))) + 2);
+    // (unsigned: the sum of the 3 squares goes over 2^31)
+    return (jo_sqrt((unsigned int)JO_SQUARE((hi[0] - lo[0] + 1) / 2) + (unsigned int)JO_SQUARE((hi[1] - lo[1] + 1) / 2) +
+                    (unsigned int)JO_SQUARE((hi[2] - lo[2] + 1) / 2)) + 2);
 }
 
 /** @brief The box of a ray segment (whole units, a margin of 1)
@@ -8890,6 +9334,7 @@ bool                                        jo_3d_draw_standing_sprite(const int
 {
     jo_pos3D_fixed                          v;
     jo_pos2D_fixed                          points[4];
+    jo_vdp1_sprite_attribute                attr;
     jo_fixed                                k;
     int                                     w;
     int                                     h;
@@ -8900,8 +9345,10 @@ bool                                        jo_3d_draw_standing_sprite(const int
     if (!jo_3d_standing_sprite_foot(JO_3D_CURRENT_MATRIX, foot, &v, &k) ||
         !jo_3d_standing_sprite_points(&v, k, width, height, sway, flip, points, &w, &h))
         return (false);
-    // Far away: a smaller copy of the texture
-    jo_sprite_draw_4p_fixed(jo_3d_mipmap(sprite_id, w, h), points, v.z, true);
+    // Far away: a smaller copy of the texture (the command of jo_sprite_draw_4p_fixed(), its colors in their bank when it fades)
+    __jo_sprite_attributes_of(&attr, jo_3d_mipmap(sprite_id, w, h), &__jo_sprite_attributes);
+    jo_3d_fade_attribute(&attr, &__jo_3d_fade, sprite_id, v.z);
+    __jo_vdp1_draw_sprite_4p(points, v.z, &attr);
     return (true);
 }
 
