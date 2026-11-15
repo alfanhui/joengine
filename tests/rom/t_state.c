@@ -5,6 +5,7 @@
 
 #include "jt.h"
 #include "tests.h"
+#include "internal/vdp2.h"
 
 #define T_VDP2_REGS             (0x120 / 2)
 #define T_REG(ADDRESS)          (jo_vdp2_get_registers()[((ADDRESS) - 0x25F80000) / 2])
@@ -485,6 +486,230 @@ static void                     t_vdp2_malloc(void)
 ** Files (cd/TEST.TXT)
 */
 
+/** @brief The bytes of cd/DATA/PATTERN.BIN wrong in a piece of it
+ *  @param p The piece
+ *  @param offset Its place in the file
+ *  @param len Its size
+ */
+static int                      t_pattern_errors(const unsigned char * const p, const int offset, const int len)
+{
+    int                         bad;
+    int                         i;
+
+    for (bad = 0, i = 0; i < len; ++i)
+        if (p[i] != (unsigned char)(((offset + i) * 7 + ((offset + i) >> 8)) & 255))
+            ++bad;
+    return (bad);
+}
+
+/** @brief The reads of an open file (cd/DATA/PATTERN.BIN, 5001 bytes): through the read buffer, the whole sectors of a big
+ *  read straight to the output (aligned or not), the end of the file */
+static void                     t_file_reads(void)
+{
+    unsigned char               *buf;
+    jo_file                     file;
+    bool                        ok;
+
+    jt_group("fs.reads");
+    // (allocated: in the BSS the test ROM no longer fit under the Linux compiler)
+    buf = (unsigned char *)jo_malloc(5008);
+    JT_TRUE(buf != JO_NULL);
+    if (buf == JO_NULL)
+        return ;
+    JT_TRUE(jo_fs_cd("DATA"));
+    // 3 bytes, then 4096: the rest of the read buffer (1 sector), a whole sector straight to the output (aligned: the
+    // DMA), 3 bytes through the read buffer
+    ok = jo_fs_open(&file, "PATTERN.BIN");
+    JT_TRUE(ok);
+    if (ok)
+    {
+        JT_EQ(jo_fs_read_next_bytes(&file, (char *)buf, 3), 3);
+        JT_EQ(jo_fs_read_next_bytes(&file, (char *)buf + 4, 4096), 4096);
+        JT_EQ(t_pattern_errors(buf, 0, 3) + t_pattern_errors(buf + 4, 3, 4096), 0);
+        // The end of the file: the bytes left, then none
+        JT_EQ(jo_fs_read_next_bytes(&file, (char *)buf, 1000), 902);
+        JT_EQ(t_pattern_errors(buf, 4099, 902), 0);
+        JT_EQ(jo_fs_read_next_bytes(&file, (char *)buf, 10), 0);
+        jo_fs_close(&file);
+    }
+    // A whole sector straight to an output not aligned (the CPU stores the bytes), then jo_fs_read_exact()
+    ok = jo_fs_open(&file, "PATTERN.BIN");
+    JT_TRUE(ok);
+    if (ok)
+    {
+        JT_EQ(jo_fs_read_next_bytes(&file, (char *)buf + 1, 4100), 4100);
+        JT_EQ(t_pattern_errors(buf + 1, 0, 4100), 0);
+        JT_TRUE(jo_fs_read_exact(&file, buf, 901));
+        JT_EQ(t_pattern_errors(buf, 4100, 901), 0);
+        JT_TRUE(!jo_fs_read_exact(&file, buf, 1));
+        jo_fs_close(&file);
+    }
+    // A read buffer of 2 sectors (filled when the file is opened), a seek forward in it
+    jo_fs_set_read_sector_count(2);
+    ok = jo_fs_open(&file, "PATTERN.BIN");
+    jo_fs_set_read_sector_count(1);
+    JT_TRUE(ok);
+    if (ok)
+    {
+        JT_EQ(jo_fs_read_next_bytes(&file, (char *)buf, 2048), 2048);
+        JT_TRUE(jo_fs_seek_forward(&file, 100));
+        JT_EQ(jo_fs_read_next_bytes(&file, (char *)buf + 2048, 3000), 2853);
+        JT_EQ(t_pattern_errors(buf, 0, 2048) + t_pattern_errors(buf + 2048, 2148, 2853), 0);
+        jo_fs_close(&file);
+    }
+    jo_fs_cd(JO_PARENT_DIR);
+    jo_free(buf);
+}
+
+#ifdef JO_COMPILE_WITH_FS_SUPPORT
+
+/*
+** Textures of 16 colors of a level (section TX16): a level built in memory
+*/
+
+/** @brief A level with a section TX16: 2 textures of 8 x 2 pixels, a palette of 3 colors */
+typedef struct
+{
+    jo_level_tx16_header        header;
+    jo_level_tx16_record        records[2];
+    jo_color                    colors[4];
+    unsigned char               pixels[16];
+}                               t_tx16_section;
+
+typedef struct
+{
+    t_tx16_section              section;
+    jo_level_directory_entry    directory;
+    jo_level                    level;
+}                               t_tx16_file;
+
+#define T_TX16_FIELD(FIELD)     ((unsigned int)__builtin_offsetof(t_tx16_section, FIELD))
+
+/** @brief The damaged sections: a field changed (its offset in the section, its size, its value), refused */
+static const unsigned int       t_tx16_damages[][3] =
+{
+    {T_TX16_FIELD(records[1].pixels), 4, 12},           // Past the pixels
+    {T_TX16_FIELD(records[1].pixels), 4, 6},            // Not aligned
+    {T_TX16_FIELD(records[1].width), 2, 4},             // Not a multiple of 8
+    {T_TX16_FIELD(records[1].colors[5]), 1, 4},         // Not in the palette
+    {T_TX16_FIELD(header.pixel_size), 4, 0xFFFFFFF0u},  // Past the section
+    {T_TX16_FIELD(header.color_count), 2, 0x4000},      // More than 255 colors
+};
+
+/** @brief The tables of the textures: with the palette 5, then the second texture with RGB colors */
+static const jo_color           t_tx16_luts[3][16] =
+{
+    {0, 5 * 256 + 1, 5 * 256 + 2},
+    {0, 5 * 256 + 2, 0, (2 << 11) | (5 * 256 + 3)},
+    {0, JO_COLOR_RGB(0, 255, 0), 0, JO_COLOR_RGB(0, 0, 255)},
+};
+
+static void                     t_tx16_init(t_tx16_file * const f)
+{
+    t_tx16_section              *s;
+    int                         k;
+
+    jo_memset(f, 0, sizeof(*f));
+    s = &f->section;
+    s->header.color_count = 3;
+    s->header.colors = T_TX16_FIELD(colors);
+    s->header.pixel_size = sizeof(s->pixels);
+    s->header.pixels = T_TX16_FIELD(pixels);
+    // (the MSB of the colors as in the color RAM: the second one without it)
+    s->colors[0] = JO_COLOR_RGB(255, 0, 0);
+    s->colors[1] = JO_COLOR_RGB(0, 255, 0) & 0x7FFF;
+    s->colors[2] = JO_COLOR_RGB(0, 0, 255);
+    for (JO_ZERO(k); k < 16; ++k)
+        s->pixels[k] = (unsigned char)(k * 17);
+    // Texture 0: the pixel values 1 and 2 are the colors 1 and 2; texture 1: the value 3 is the color 3 with the ratio 2
+    s->records[0].width = 8;
+    s->records[0].height = 2;
+    s->records[0].colors[1] = 1;
+    s->records[0].colors[2] = 2;
+    s->records[1] = s->records[0];
+    s->records[1].pixels = 8;
+    s->records[1].value = 77;
+    s->records[1].colors[2] = 0;
+    s->records[1].colors[1] = 2;
+    s->records[1].colors[3] = 3;
+    s->records[1].ratios[3] = 2;
+    f->directory.id = JO_LEVEL_SECTION_TX16;
+    f->directory.version = JO_LEVEL_TX16_VERSION;
+    f->directory.size = sizeof(*s);
+    f->directory.header_size = sizeof(s->header);
+    f->directory.record_size = sizeof(s->records[0]);
+    f->directory.record_count = 2;
+    f->level.data = (unsigned char *)s;
+    f->level.size = sizeof(*s);
+    f->level.directory = &f->directory;
+    f->level.section_count = 1;
+}
+
+static void                     t_textures16(void)
+{
+    // (a palette in the work RAM: the color RAM has no free, the scenes create their palettes after the checks)
+    jo_color                    colors[8];
+    jo_palette                  palette;
+    t_tx16_file                 *f;
+    unsigned char               *field;
+    unsigned int                count;
+    jo_img                      img;
+    int                         ids[3];
+    int                         last;
+    int                         bad;
+    int                         k;
+
+    jt_group("level.textures16");
+    // (allocated: in the BSS the test ROM 320x224 no longer fit under the Linux compiler; the failed checks: the bits of
+    // bad, one per check, to keep the program small)
+    if ((f = (t_tx16_file *)jo_malloc(sizeof(*f))) == JO_NULL)
+        return ;
+    t_tx16_init(f);
+    palette.data = colors;
+    palette.id = 5;
+    last = jo_get_last_sprite_id();
+    // The palette; the textures with the color codes of the palette, the second one again with RGB colors: their tables,
+    // their pixels
+    bad = (!jo_level_set_textures16_palette(&f->level, &palette)) | (jo_memcmp(colors, f->section.colors, 3 * sizeof(jo_color)) != 0) << 1 |
+          (!jo_level_add_textures16(&f->level, &palette, 0, 2, ids)) << 2 | (!jo_level_add_textures16(&f->level, JO_NULL, 1, 1, ids + 2)) << 3;
+    for (k = 0; k < 3 && !(bad & 12); ++k)
+        if (ids[k] != last + 1 + k || jo_sprite_get_lut(ids[k]) == JO_NULL ||
+            jo_memcmp(jo_sprite_get_lut(ids[k]), t_tx16_luts[k], sizeof(t_tx16_luts[k])) != 0 || jo_sprite_get_height(ids[k]) != 2 ||
+            jo_memcmp(jo_sprite_get_raw_data(ids[k]), f->section.pixels + (k == 0 ? 0 : 8), 8) != 0)
+            bad |= 16 << k;
+    // The fields of the game; not these textures: refused
+    bad |= (JO_LEVEL_RECORDS(&f->level, TX16, tx16, &count)[1].value != 77) << 7 | jo_level_add_textures16(&f->level, &palette, 1, 2, ids) << 8 |
+           jo_level_add_textures16(&f->level, &palette, -1, 1, ids) << 9;
+    // A damaged section: refused, no sprite made
+    for (k = 0; k < JT_COUNT(t_tx16_damages); ++k)
+    {
+        t_tx16_init(f);
+        field = (unsigned char *)&f->section + t_tx16_damages[k][0];
+        if (t_tx16_damages[k][1] == 4)
+            *(unsigned int *)field = t_tx16_damages[k][2];
+        else if (t_tx16_damages[k][1] == 2)
+            *(unsigned short *)field = (unsigned short)t_tx16_damages[k][2];
+        else
+            *field = (unsigned char)t_tx16_damages[k][2];
+        bad |= jo_level_add_textures16(&f->level, (k & 1) ? JO_NULL : &palette, 0, 2, ids) << (10 + k);
+    }
+    bad |= jo_level_set_textures16_palette(&f->level, &palette) << 16 | (jo_get_last_sprite_id() != last + 3) << 17;
+    // A level without textures (a section of the game with the same letters); an RGB sprite: no table
+    f->directory.id = JO_LEVEL_ID('t', 'x', '1', '6');
+    bad |= jo_level_set_textures16_palette(&f->level, &palette) << 18 | jo_level_add_textures16(&f->level, &palette, 0, 1, ids) << 19;
+    img.width = 8;
+    img.height = 1;
+    img.data = colors;
+    k = jo_sprite_add(&img);
+    bad |= (k != last + 4 || jo_sprite_get_lut(k) != JO_NULL) << 20;
+    jo_sprite_free_from(last + 1);
+    JT_EQ(bad, 0);
+    JT_EQ(jo_get_last_sprite_id(), last);
+    jo_free(f);
+}
+
+#endif
+
 static void                     t_files(void)
 {
     char                        *data;
@@ -519,6 +744,99 @@ static void                     t_files(void)
         jo_free(data);
 }
 
+/*
+** The VDP2 with the image of its frame (see __jo_vdp2_end_frame()): each frame sets the NBG0 scroll, the frames are
+** 1.2 and 0.5 field long in turn (two frames can end in the same field). At each VBLANK where the VDP1 displays a new
+** image, the VDP2 state applied is the one of that frame, and no state is applied at the other VBLANKs
+*/
+static int                      t_vdp2_frames_vblank_id = -1;
+static volatile bool            t_vdp2_frames_on = false;
+static unsigned int             t_vdp2_frames_first;
+static unsigned int             t_vdp2_frames_count;
+static volatile unsigned int    t_vdp2_frames_shown;
+static volatile unsigned int    t_vdp2_frames_wrong;
+static volatile unsigned int    t_vdp2_frames_early;
+static volatile unsigned int    t_vdp2_frames_applied;
+
+static void                     t_vdp2_frames_vblank(void)
+{
+    unsigned int                applied;
+    unsigned int                tag;
+
+    if (!t_vdp2_frames_on)
+        return;
+    applied = __jo_vdp2_applied_frame_tag();
+    if (__jo_vdp1_displayed_frame_changed(&tag))
+    {
+        if ((int)(tag - t_vdp2_frames_first) >= 0)
+        {
+            ++t_vdp2_frames_shown;
+            if (applied != tag)
+                ++t_vdp2_frames_wrong;
+        }
+    }
+    else if (applied != t_vdp2_frames_applied)
+        ++t_vdp2_frames_early;
+    t_vdp2_frames_applied = applied;
+}
+
+void                            t_vdp2_frames_setup(void)
+{
+    t_vdp2_frames_count = 0;
+    t_vdp2_frames_shown = 0;
+    t_vdp2_frames_wrong = 0;
+    t_vdp2_frames_early = 0;
+    t_vdp2_frames_applied = __jo_vdp2_applied_frame_tag();
+    // (the frame built now is the first one of the test)
+    t_vdp2_frames_first = __jo_vdp1_frame_tag();
+    if (t_vdp2_frames_vblank_id < 0)
+        t_vdp2_frames_vblank_id = jo_core_add_vblank_callback(t_vdp2_frames_vblank);
+    t_vdp2_frames_on = true;
+}
+
+void                            t_vdp2_frames_draw(void)
+{
+    unsigned int                vblank;
+    int                         start;
+
+    ++t_vdp2_frames_count;
+    jo_vdp2_move_nbg0((int)(t_vdp2_frames_count & 255), 0);
+    if (t_vdp2_frames_count & 1)
+    {
+        // About 1.2 field: past the next VBLANK, then 1/5 field
+        vblank = jo_core_get_vblank_count();
+        while (jo_core_get_vblank_count() == vblank)
+            ;
+        start = jo_time_get_frc();
+        while (((jo_time_get_frc() - start) & 0xFFFF) < 2800)
+            ;
+    }
+    else
+    {
+        // About 0.5 field
+        start = jo_time_get_frc();
+        while (((jo_time_get_frc() - start) & 0xFFFF) < 7000)
+            ;
+    }
+}
+
+void                            t_vdp2_frames_measure(void)
+{
+    jt_group("vdp2.frames");
+    JT_TRUE(t_vdp2_frames_shown > 30);
+    JT_EQ(t_vdp2_frames_wrong, 0);
+    JT_EQ(t_vdp2_frames_early, 0);
+}
+
+void                            t_vdp2_frames_cleanup(void)
+{
+    t_vdp2_frames_on = false;
+    if (t_vdp2_frames_vblank_id >= 0)
+        jo_core_remove_vblank_callback(t_vdp2_frames_vblank_id);
+    t_vdp2_frames_vblank_id = -1;
+    jo_vdp2_move_nbg0(0, 0);
+}
+
 void                            t_state(void)
 {
     t_screen_modes();
@@ -529,4 +847,8 @@ void                            t_state(void)
     t_sprite_shapes();
     t_vdp2_malloc();
     t_files();
+    t_file_reads();
+#ifdef JO_COMPILE_WITH_FS_SUPPORT
+    t_textures16();
+#endif
 }

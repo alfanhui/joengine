@@ -60,7 +60,10 @@ extern jo_texture_definition        __jo_sprite_def[];
 extern bool                         __jo_sprite_end_codes[];
 extern unsigned short               __jo_sprite_mean_color[];
 extern jo_sprite_attributes         __jo_sprite_attributes;
-jo_3d_quad                          *__jo_sprite_quad[JO_MAX_SPRITE];
+/* The quads of the sprites drawn in 3D (see jo_3d_create_sprite_quad()): the table allocated with the first quad, freed with
+   the last one (4 bytes per sprite in each program before, for the few games that draw sprites in 3D) */
+jo_3d_quad                          **__jo_sprite_quad = JO_NULL;
+static int                          __jo_sprite_quad_count = 0;
 
 /*
 ** Coordinate system: X to the right, Y down, Z into the screen.
@@ -297,11 +300,16 @@ typedef struct
 /** @brief The last sprite of the tiles of a texture (the finer levels share one) */
 # define JO_3D_TILE_LAST_SPRITE(T)          ((T)->sprite[JO_MIN(JO_3D_TILE_LEVEL_COUNT(T), JO_3D_TILE_LEVELS + 1) - 1])
 
+/* The tiles of each texture: a pointer per sprite (JO_NULL: none), the tiles in a pool (see jo_3d_tiles_for_write()). Most
+   sprites have none (the smaller copies and the tiles of a texture are sprites too): 4 bytes per sprite instead of 12 (with
+   the smaller copies: 51 KB for the 1600 sprites of the rally demo, 27 textures with smaller copies and 38 with tiles) */
 /* (read by the assembly polygon loop: kept with their names by the link time optimization) */
-jo_3d_texture_tiles                         __jo_3d_tiles[JO_MAX_SPRITE] __attribute__((used, externally_visible));
+jo_3d_texture_tiles                         *__jo_3d_tiles[JO_MAX_SPRITE] __attribute__((used, externally_visible));
 
-// (the assembly polygon loop reads levels at sprite x 12)
-_Static_assert(sizeof(jo_3d_texture_tiles) == 12, "__jo_3d_polygon_loop: size of jo_3d_texture_tiles");
+/** @brief No tiles (read in place of the tiles of a texture without them) */
+static const jo_3d_texture_tiles            __jo_3d_no_tiles;
+
+// (the assembly polygon loop reads the pointer of the tiles at sprite x 4, then their levels, error and depth)
 // (the assembly polygon loop uses these values, see its label 50)
 _Static_assert(JO_3D_SUBDIVISION_ERROR == 8 && JO_3D_TILES_NEAR_ONLY == 128 && (JO_3D_CODE_SCREEN | JO_3D_CODE_VIEW) == 79 &&
                JO_3D_CODE_MASK == 127 && JO_3D_SLIVER_EXTENT == 64 && JO_3D_SLIVER_WIDTH == 4, "__jo_3d_polygon_loop: constants");
@@ -350,9 +358,9 @@ typedef struct
     int                                     area[2];
 }                                           jo_3d_texture_mipmaps;
 
-jo_3d_texture_mipmaps                       __jo_3d_mipmaps[JO_MAX_SPRITE] __attribute__((used, externally_visible));
-// (the assembly polygon loop reads the copies at sprite x 20: the smaller copies were never used when the structure grew)
-_Static_assert(sizeof(jo_3d_texture_mipmaps) == 20, "__jo_3d_polygon_loop: size of jo_3d_texture_mipmaps");
+/* The smaller copies of each texture: a pointer per sprite (JO_NULL: none), as the tiles (4 bytes per sprite instead of 20) */
+jo_3d_texture_mipmaps                       *__jo_3d_mipmaps[JO_MAX_SPRITE] __attribute__((used, externally_visible));
+// (the assembly polygon loop reads the pointer of the copies at sprite x 4, then their fields at these offsets)
 _Static_assert(__builtin_offsetof(jo_3d_texture_mipmaps, first) == 2 && __builtin_offsetof(jo_3d_texture_mipmaps, width) == 4 &&
                __builtin_offsetof(jo_3d_texture_mipmaps, height) == 8 && __builtin_offsetof(jo_3d_texture_mipmaps, area) == 12,
                "__jo_3d_polygon_loop: offsets of jo_3d_texture_mipmaps");
@@ -367,10 +375,117 @@ unsigned char                               __jo_3d_texture_flags[JO_MAX_SPRITE]
 /** @brief Compute the flags of a texture again (after a change of its tiles or of its smaller copies)
  *  @param sprite_id Texture
  */
+/*
+** The pools of the tiles and of the smaller copies of the textures: JO_3D_TEXTURE_POOL textures of each, the next ones
+** allocated (jo_malloc(): a game with more textures with tiles or copies than that, see JO_3D_TEXTURE_POOL)
+*/
+
+/** @brief Textures with tiles, and textures with smaller copies, kept in the pools of the engine (more: allocated) */
+#ifndef JO_3D_TEXTURE_POOL
+# define JO_3D_TEXTURE_POOL                 (JO_MAX_SPRITE / 16 < 16 ? 16 : JO_MAX_SPRITE / 16)
+#endif
+
+static jo_3d_texture_tiles                  __jo_3d_tile_pool[JO_3D_TEXTURE_POOL];
+static unsigned char                        __jo_3d_tile_pool_used[JO_3D_TEXTURE_POOL];
+static jo_3d_texture_mipmaps                __jo_3d_mipmap_pool[JO_3D_TEXTURE_POOL];
+static unsigned char                        __jo_3d_mipmap_pool_used[JO_3D_TEXTURE_POOL];
+
+/** @brief A cleared entry of a pool, else allocated
+ *  @return The entry, JO_NULL if out of memory
+ */
+static void                                 *jo_3d_texture_entry_new(unsigned char * const pool, unsigned char * const used,
+                                                                     const unsigned int size)
+{
+    void                                    *entry;
+    int                                     k;
+
+    for (JO_ZERO(k); k < JO_3D_TEXTURE_POOL; ++k)
+        if (!used[k])
+        {
+            used[k] = 1;
+            entry = pool + k * size;
+            jo_memset(entry, 0, size);
+            return (entry);
+        }
+    if ((entry = jo_malloc(size)) != JO_NULL)
+        jo_memset(entry, 0, size);
+    return (entry);
+}
+
+/** @brief Give back an entry (to its pool, or to jo_malloc()) */
+static void                                 jo_3d_texture_entry_free(void * const entry, unsigned char * const pool,
+                                                                     unsigned char * const used, const unsigned int size)
+{
+    if ((unsigned char *)entry >= pool && (unsigned char *)entry < pool + JO_3D_TEXTURE_POOL * size)
+        used[((unsigned char *)entry - pool) / size] = 0;
+    else
+        jo_free(entry);
+}
+
+/** @brief The tiles of a texture, an entry made when it has none (cleared)
+ *  @return The tiles, JO_NULL if out of memory
+ */
+static jo_3d_texture_tiles                  *jo_3d_tiles_for_write(const int sprite_id)
+{
+    if (__jo_3d_tiles[sprite_id] == JO_NULL)
+        __jo_3d_tiles[sprite_id] = (jo_3d_texture_tiles *)jo_3d_texture_entry_new((unsigned char *)__jo_3d_tile_pool, __jo_3d_tile_pool_used,
+                                                                                  sizeof(jo_3d_texture_tiles));
+    return (__jo_3d_tiles[sprite_id]);
+}
+
+/** @brief The tiles of a texture to read (no tiles: an entry without them) */
+static  __jo_force_inline const jo_3d_texture_tiles *jo_3d_tiles_of(const int sprite_id)
+{
+    return (__jo_3d_tiles[sprite_id] != JO_NULL ? __jo_3d_tiles[sprite_id] : &__jo_3d_no_tiles);
+}
+
+/** @brief Give back the tiles of a texture */
+static void                                 jo_3d_tiles_release(const int sprite_id)
+{
+    if (__jo_3d_tiles[sprite_id] == JO_NULL)
+        return;
+    jo_3d_texture_entry_free(__jo_3d_tiles[sprite_id], (unsigned char *)__jo_3d_tile_pool, __jo_3d_tile_pool_used,
+                             sizeof(jo_3d_texture_tiles));
+    __jo_3d_tiles[sprite_id] = JO_NULL;
+}
+
+/** @brief The smaller copies of a texture, an entry made when it has none (cleared)
+ *  @return The copies, JO_NULL if out of memory
+ */
+static jo_3d_texture_mipmaps                *jo_3d_mipmaps_for_write(const int sprite_id)
+{
+    if (__jo_3d_mipmaps[sprite_id] == JO_NULL)
+        __jo_3d_mipmaps[sprite_id] = (jo_3d_texture_mipmaps *)jo_3d_texture_entry_new((unsigned char *)__jo_3d_mipmap_pool,
+                                                                                      __jo_3d_mipmap_pool_used,
+                                                                                      sizeof(jo_3d_texture_mipmaps));
+    return (__jo_3d_mipmaps[sprite_id]);
+}
+
+/** @brief Give back the smaller copies of a texture */
+static void                                 jo_3d_mipmaps_release(const int sprite_id)
+{
+    if (__jo_3d_mipmaps[sprite_id] == JO_NULL)
+        return;
+    jo_3d_texture_entry_free(__jo_3d_mipmaps[sprite_id], (unsigned char *)__jo_3d_mipmap_pool, __jo_3d_mipmap_pool_used,
+                             sizeof(jo_3d_texture_mipmaps));
+    __jo_3d_mipmaps[sprite_id] = JO_NULL;
+}
+
 static void                                 jo_3d_update_texture_flags(const int sprite_id)
 {
-    __jo_3d_texture_flags[sprite_id] = (unsigned char)((__jo_3d_tiles[sprite_id].levels != 0 ? JO_3D_TEXTURE_HAS_TILES : 0) |
-                                                       (__jo_3d_mipmaps[sprite_id].levels != 0 ? JO_3D_TEXTURE_HAS_MIPMAPS : 0));
+    const jo_3d_texture_tiles               *tiles;
+    const jo_3d_texture_mipmaps             *mip;
+
+    // (the entries left empty given back: tiles not made, no settings; copies not made)
+    tiles = __jo_3d_tiles[sprite_id];
+    if (tiles != JO_NULL && tiles->levels == 0 && tiles->error == 0 && tiles->depth == 0)
+        jo_3d_tiles_release(sprite_id);
+    mip = __jo_3d_mipmaps[sprite_id];
+    if (mip != JO_NULL && mip->levels == 0)
+        jo_3d_mipmaps_release(sprite_id);
+    __jo_3d_texture_flags[sprite_id] = (unsigned char)((__jo_3d_tiles[sprite_id] != JO_NULL && __jo_3d_tiles[sprite_id]->levels != 0 ?
+                                                        JO_3D_TEXTURE_HAS_TILES : 0) |
+                                                       (__jo_3d_mipmaps[sprite_id] != JO_NULL ? JO_3D_TEXTURE_HAS_MIPMAPS : 0));
 }
 
 /*
@@ -489,7 +604,8 @@ static  __jo_force_inline int               jo_3d_tint_component(const int tint,
 {
     int                                     v;
 
-    v = (tint >> shift) & 0x1f;
+    // (a logical shift, the same 5 bits: the arithmetic shift by 10 was a call of libgcc, ___ashiftrt_r4_10)
+    v = (int)(((unsigned int)tint >> shift) & 0x1f);
     return ((v >= 16 ? v - 32 : v) * 2);
 }
 
@@ -725,18 +841,24 @@ void                                        __jo_3d_forget_sprites_from(const in
     int                                     i;
 
     // (the tiles and the smaller copies are sprites added after their texture: a texture kept whose copies are freed loses
-    // them too)
+    // them too; a texture freed loses its tiles, its settings of the tiles and its copies)
     for (JO_ZERO(i); i < JO_MAX_SPRITE; ++i)
     {
-        // (the sprites of the last level are the last ones: one of them freed, the tiles are lost)
-        if (__jo_3d_tiles[i].levels != 0 && (i >= sprite_id || (int)JO_3D_TILE_LAST_SPRITE(&__jo_3d_tiles[i]) >= sprite_id))
+        if (__jo_3d_tiles[i] == JO_NULL && __jo_3d_mipmaps[i] == JO_NULL)
+            continue;
+        if (i >= sprite_id)
         {
-            __jo_3d_tiles[i].levels = 0;
-            __jo_3d_tiles[i].error = 0;
-            __jo_3d_tiles[i].depth = 0;
+            jo_3d_tiles_release(i);
+            jo_3d_mipmaps_release(i);
         }
-        if (__jo_3d_mipmaps[i].levels != 0 && (i >= sprite_id || (int)__jo_3d_mipmaps[i].first + __jo_3d_mipmaps[i].levels - 1 >= sprite_id))
-            __jo_3d_mipmaps[i].levels = 0;
+        else
+        {
+            // (the sprites of the last level are the last ones: one of them freed, the tiles are lost)
+            if (__jo_3d_tiles[i] != JO_NULL && __jo_3d_tiles[i]->levels != 0 && (int)JO_3D_TILE_LAST_SPRITE(__jo_3d_tiles[i]) >= sprite_id)
+                jo_3d_tiles_release(i);
+            if (__jo_3d_mipmaps[i] != JO_NULL && (int)__jo_3d_mipmaps[i]->first + __jo_3d_mipmaps[i]->levels - 1 >= sprite_id)
+                jo_3d_mipmaps_release(i);
+        }
         jo_3d_update_texture_flags(i);
     }
     // The sprites that fade (see jo_3d_set_sprite_fade())
@@ -819,6 +941,14 @@ static bool                                 __jo_3d_slave_tables_taken = false;
 /** @brief A copy of the commands of the slave CPU was started this frame (by its DMA controller, see jo_3d_slave_end()) */
 static bool                                 __jo_3d_slave_copy_started = false;
 
+/** @brief 2^(32 - k) for k from 1 to 31 (k = 0: unused), see jo_3d_set_front_layer() */
+static const unsigned int                   __jo_3d_pow2_32[32] =
+{
+    0u, 0x80000000u, 0x40000000u, 0x20000000u, 0x10000000u, 0x8000000u, 0x4000000u, 0x2000000u, 0x1000000u, 0x800000u,
+    0x400000u, 0x200000u, 0x100000u, 0x80000u, 0x40000u, 0x20000u, 0x10000u, 0x8000u, 0x4000u, 0x2000u, 0x1000u, 0x800u,
+    0x400u, 0x200u, 0x100u, 0x80u, 0x40u, 0x20u, 0x10u, 0x8u, 0x4u, 0x2u
+};
+
 /* State of the master CPU */
 static jo_3d_cpu_context                    __jo_3d_master = {__jo_3d_vertices, JO_3D_MAX_VERTICES, __jo_3d_view, JO_NULL, 0, -1, &__jo_vdp1_depth_bias, 0, 0,
                                                               JO_3D_CLIP_GOURAUD_TABLES,
@@ -900,9 +1030,9 @@ static void                                 jo_3d_normalize(jo_pos3D_fixed *v)
     }
     if (len2 > JO_FIXED_MAX)
     {
-        v->x >>= 8;
-        v->y >>= 8;
-        v->z >>= 8;
+        v->x = jo_shift_right8(v->x);
+        v->y = jo_shift_right8(v->y);
+        v->z = jo_shift_right8(v->z);
         jo_3d_normalize(v);
         return;
     }
@@ -1364,7 +1494,8 @@ static __attribute__((noinline)) void       jo_3d_prepare_light(jo_3d_light_cont
     d12 = ((long long)m[1][0] * m[2][0] + (long long)m[1][1] * m[2][1] + (long long)m[1][2] * m[2][2]) >> 16;
     // (relative to the scale: 1/256 of |row 0|², the absolute tolerance of a scale of 1. A small flattened model (0.06,
     // 0.03, 0.06) passed as uniform, its normals were lit as the ones of a sphere)
-    tolerance = JO_MAX(s0 >> 8, 1);
+    // (s0 >= 0: a logical shift, not ___ashiftrt_r4_8 of libgcc)
+    tolerance = JO_MAX((long long)((unsigned long long)s0 >> 8), 1);
     context->uniform_scale = s0 > 0 && s0 <= JO_FIXED_MAX &&
                              JO_ABS(s1 - s0) <= tolerance && JO_ABS(s2 - s0) <= tolerance &&
                              JO_ABS(d01) <= tolerance && JO_ABS(d02) <= tolerance && JO_ABS(d12) <= tolerance;
@@ -2516,8 +2647,8 @@ int __attribute__((noinline, used, externally_visible)) __jo_3d_mipmap_select(co
 {
     const jo_3d_texture_mipmaps             *mip;
 
-    mip = &__jo_3d_mipmaps[sprite_id];
-    if (mip->levels == 0)
+    mip = __jo_3d_mipmaps[sprite_id];
+    if (mip == JO_NULL || mip->levels == 0)
         return (sprite_id);
     // (the limits: see jo_3d_mipmap_limits())
     if (width * height > mip->area[0] || width > mip->width[0] || height > mip->height[0])
@@ -2749,7 +2880,14 @@ static  __jo_force_inline bool              jo_3d_emit_polygon(jo_3d_cpu_context
     sort_key = JO_FIXED_TO_INT(key) + *ctx->depth_bias;
     // The front layer (a rear-view mirror): in front of all the other polygons, sorted among themselves
     if (ctx->front_shift >= 0)
-        sort_key = (JO_MAX(JO_FIXED_TO_INT(key), 0) >> ctx->front_shift) + 1;
+    {
+        // (a shift by a variable count of bits is a loop of libgcc (___ashrsi3) on the SH-2: the high word of a product by
+        // 2^(32 - shift) instead, the same value for a positive key)
+        sort_key = JO_MAX(JO_FIXED_TO_INT(key), 0);
+        if (ctx->front_shift > 0)
+            sort_key = (int)(((unsigned long long)(unsigned int)sort_key * __jo_3d_pow2_32[ctx->front_shift & 31]) >> 32);
+        ++sort_key;
+    }
     keys[*used] = sort_key < 0 ? 0 : (sort_key > JO_VDP1_MAX_KEY ? JO_VDP1_MAX_KEY : (unsigned short)sort_key);
     cmd = &commands[(*used)++];
     ++*ctx->displayed_polygon_count;
@@ -2816,7 +2954,7 @@ static  __jo_force_inline bool              jo_3d_emit_polygon(jo_3d_cpu_context
     else if (a->sort & JO_3D_USE_TEXTURE)
     {
         // Far away: a smaller copy of the texture (size on the screen: the longest of the 2 edges of each direction)
-        texture = &__jo_sprite_def[__jo_3d_mipmaps[a->texture_id].levels == 0 ? a->texture_id :
+        texture = &__jo_sprite_def[!(__jo_3d_texture_flags[a->texture_id] & JO_3D_TEXTURE_HAS_MIPMAPS) ? a->texture_id :
                                    jo_3d_mipmap(a->texture_id,
                                                 JO_MAX(JO_MAX(JO_ABS(x1 - x0), JO_ABS(y1 - y0)), JO_MAX(JO_ABS(x2 - x3), JO_ABS(y2 - y3))),
                                                 JO_MAX(JO_MAX(JO_ABS(x3 - x0), JO_ABS(y3 - y0)), JO_MAX(JO_ABS(x2 - x1), JO_ABS(y2 - y1))))];
@@ -3327,8 +3465,8 @@ static  __jo_force_inline int               jo_3d_subdivision_level(const jo_3d_
         JO_SUB_REASON(6);
         return (0);
     }
-    tiles = &__jo_3d_tiles[a->texture_id];
-    if (tiles->levels == 0)
+    tiles = __jo_3d_tiles[a->texture_id];
+    if (tiles == JO_NULL || tiles->levels == 0)
     {
         JO_SUB_REASON(7);
         return (0);
@@ -3538,8 +3676,9 @@ static bool                                 jo_3d_extrapolate_near_tile(const jo
                     fb += fa;
                     while (fb > 0x7FFFFFFF)
                     {
-                        fa >>= 8;
-                        fb >>= 8;
+                        // (both positive: logical shifts, the same values, not ___ashiftrt_r4_8 of libgcc)
+                        fa = (long long)((unsigned long long)fa >> 8);
+                        fb = (long long)((unsigned long long)fb >> 8);
                     }
                     tc = jo_fixed_div((jo_fixed)fa, (jo_fixed)fb);
                     t = JO_MIN(t, tc);
@@ -3587,11 +3726,14 @@ static bool                                 jo_3d_extrapolate_near_tile(const jo
 }
 
 
-/** @brief Bytes of a line of a texture: 2 per pixel (RGB), 2 pixels per byte (16 colors) */
+/** @brief Bytes of a line of a texture: 2 per pixel (RGB), 1 per pixel (256 colors), 2 pixels per byte (16 colors) */
 static  __jo_force_inline int               jo_3d_tile_line_bytes(const jo_texture_definition * const texture)
 {
-    return (__jo_sprite_pic[texture - __jo_sprite_def].color_mode == JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS ?
-            JO_DIV_BY_2(texture->width) : JO_MULT_BY_2(texture->width));
+    const int                               mode = __jo_sprite_pic[texture - __jo_sprite_def].color_mode;
+
+    if (mode == JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS)
+        return (JO_DIV_BY_2(texture->width));
+    return (mode == JO_VDP1_TEXTURE_SIZE_SHIFT_256_COLORS ? texture->width : JO_MULT_BY_2(texture->width));
 }
 
 /** @brief Tiles per side of a level (no shift by a variable amount: the SH-2 has no barrel shifter) */
@@ -4124,6 +4266,28 @@ static bool                                 jo_3d_all_inside(const jo_3d_vertex 
 /** @brief Pixels a point of the part of a tile seen may be outside of the quad drawn for it (see jo_3d_quad_covers()) */
 # define JO_3D_NEAR_TILE_COVER_TOLERANCE    (2)
 
+/** @brief The part of an edge cut by a side of the screen: d x a / den (see jo_3d_clip_to_screen())
+ *  @param d Difference of the coordinates of the 2 ends
+ *  @param a Distance of the first end to the side
+ *  @param den Distance of the first end minus the one of the second end (not 0, |a| <= |den|)
+ *  @return d x a / den, rounded toward 0 (the quotient is between 0 and d)
+ *  @remarks The 64 / 32 bits division of the hardware unit (39 cycles) when den fits in 32 bits, the same quotient as the
+ *  64 bits division of libgcc (___divdi3, hundreds of cycles) it replaces. The tiles through the near plane: 2 per edge
+ *  cut by a side
+ */
+static  __jo_force_inline int               jo_3d_clip_lerp(const int d, const long long a, const long long den)
+{
+    long long                               numerator;
+
+    numerator = (long long)d * a;
+    if (den != (long long)(int)den)
+        return ((int)(numerator / den));
+    JO_SH2_DVSR = (int)den;
+    JO_SH2_DVDNTH = (int)(numerator >> 32);
+    JO_SH2_DVDNTL = (int)numerator;
+    return (JO_SH2_DVDNTL);
+}
+
 /** @brief Clip a polygon of the screen by the edges of the screen (Sutherland-Hodgman: left, right, top, bottom)
  *  @param x Vertices (screen positions, 12 entries, modified)
  *  @param y Vertices
@@ -4187,8 +4351,8 @@ static int                                  jo_3d_clip_to_screen(int x[12], int 
             }
             if ((da >= 0) != (db >= 0))
             {
-                dx[m] = sx[i] + (int)((long long)(sx[j] - sx[i]) * da / (da - db));
-                dy[m++] = sy[i] + (int)((long long)(sy[j] - sy[i]) * da / (da - db));
+                dx[m] = sx[i] + jo_3d_clip_lerp(sx[j] - sx[i], da, da - db);
+                dy[m++] = sy[i] + jo_3d_clip_lerp(sy[j] - sy[i], da, da - db);
             }
         }
         n = m;
@@ -4453,7 +4617,8 @@ static int                                  jo_3d_emit_near_tile(const jo_3d_sub
                 needed = ((long long)JO_MAX(JO_ABS(out[i].x), JO_ABS(out[i].y)) * __jo_vdp1_projection_distance) >> 16;
                 if (needed > 0x7FFF0000)
                     needed = 0x7FFF0000;
-                needed_z = JO_MAX(needed_z, (jo_fixed)needed / JO_3D_NEAR_TILE_LIMIT + JO_FIXED_1);
+                // (the division unit, not ___sdivsi3 of libgcc: the same quotient, both positive)
+                needed_z = JO_MAX(needed_z, jo_int_div((jo_fixed)needed, JO_3D_NEAR_TILE_LIMIT) + JO_FIXED_1);
             }
             jo_3d_set_vertex(&screen[i], JO_3D_WINDOW_CX(s->w) + x, JO_3D_WINDOW_CY(s->w) + y, out[i].z, 0);
             // (the tile clipped by the near plane itself: what must be covered when the plane is moved, see below)
@@ -5137,9 +5302,10 @@ static bool                                 jo_3d_emit_subdivided_polygon(jo_3d_
         d1[0] >>= 4; d1[1] >>= 4; d1[2] >>= 4;
         d2[0] >>= 4; d2[1] >>= 4; d2[2] >>= 4;
     }
-    facing = (long long)((long long)d1[1] * d2[2] - (long long)d1[2] * d2[1]) * (view[0][0] >> 8) +
-             (long long)((long long)d1[2] * d2[0] - (long long)d1[0] * d2[2]) * (view[0][1] >> 8) +
-             (long long)((long long)d1[0] * d2[1] - (long long)d1[1] * d2[0]) * (view[0][2] >> 8);
+    // (jo_shift_right8(): the same shift, not 3 calls of libgcc, ___ashiftrt_r4_8)
+    facing = (long long)((long long)d1[1] * d2[2] - (long long)d1[2] * d2[1]) * jo_shift_right8(view[0][0]) +
+             (long long)((long long)d1[2] * d2[0] - (long long)d1[0] * d2[2]) * jo_shift_right8(view[0][1]) +
+             (long long)((long long)d1[0] * d2[1] - (long long)d1[1] * d2[0]) * jo_shift_right8(view[0][2]);
     mirrored = ctx->mirror ? facing > 0 : facing < 0;
     if (mirrored && a->plane == JO_3D_SINGLE_PLANE)
         return (true);
@@ -5209,7 +5375,7 @@ static bool                                 jo_3d_emit_subdivided_polygon(jo_3d_
     s.bottom = bottom;
     s.p = p;
     s.a = a;
-    s.tiles = &__jo_3d_tiles[a->texture_id];
+    s.tiles = jo_3d_tiles_of(a->texture_id);
     s.mirrored = mirrored;
     s.triangle = v[3] == v[2];
     // (the usual parts: see jo_3d_emit_part(). The key of the whole polygon set above: JO_3D_SORT_MIN, JO_3D_SORT_MAX)
@@ -5358,6 +5524,51 @@ static bool                                 jo_3d_set_texture_subdivision_4bits(
     return (tiles->levels != 0);
 }
 
+/** @brief The tiles of a 256 colors texture (see jo_3d_set_texture_subdivision()): a byte per pixel, drawn with the bank
+ *  of the polygon (its palette) */
+static bool                                 jo_3d_set_texture_subdivision_8bits(jo_3d_texture_tiles * const tiles,
+                                                                            const jo_texture_definition * const texture,
+                                                                            const unsigned char * const pixels)
+{
+    jo_img_8bits                            img;
+    unsigned char                           *data;
+    int                                     n;
+    int                                     level;
+    int                                     i;
+    int                                     j;
+    int                                     y;
+    int                                     id;
+    int                                     tw;
+    int                                     th;
+
+    for (level = 0, n = 2; level < JO_3D_TILE_LEVELS; ++level, n *= 2)
+    {
+        // (a line of a tile: a multiple of 8 bytes, the unit of the addresses of the VDP1)
+        tw = texture->width / n;
+        th = texture->height / n;
+        if (JO_MOD_POW2(tw, 8) != 0 || tw == 0 || th == 0)
+            break;
+        // The tiles one under the other: tile (i, j) from the line (j * n + i) * th
+        data = (unsigned char *)jo_malloc(tw * th * n * n);
+        if (data == JO_NULL)
+            break;
+        for (JO_ZERO(j); j < n; ++j)
+            for (JO_ZERO(i); i < n; ++i)
+                for (JO_ZERO(y); y < th; ++y)
+                    jo_memcpy(data + ((j * n + i) * th + y) * tw, pixels + (j * th + y) * texture->width + i * tw, tw);
+        img.width = (unsigned short)tw;
+        img.height = (unsigned short)(th * n * n);
+        img.data = data;
+        id = jo_sprite_add_8bits_image(&img);
+        jo_free(data);
+        if (id < 0)
+            break;
+        tiles->sprite[level] = (unsigned short)id;
+        tiles->levels = level + 1;
+    }
+    return (tiles->levels != 0);
+}
+
 /** @brief Make the tiles of a texture (see jo_3d_set_texture_subdivision()) */
 static bool                                 jo_3d_make_texture_subdivision(const int sprite_id)
 {
@@ -5376,18 +5587,23 @@ static bool                                 jo_3d_make_texture_subdivision(const
 
     if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE)
         return (false);
-    tiles = &__jo_3d_tiles[sprite_id];
-    if (tiles->levels != 0)
+    if (__jo_3d_tiles[sprite_id] != JO_NULL && __jo_3d_tiles[sprite_id]->levels != 0)
         return (true);
-    // RGB and 16 colors textures (the tiles are copies of parts of the texture in the VRAM, a 16 colors tile uses the color
-    // lookup table of the texture)
+    // RGB, 256 colors and 16 colors textures (the tiles are copies of parts of the texture in the VRAM, a 16 colors tile
+    // uses the color lookup table of the texture, a 256 colors one the bank of the polygon)
     if (__jo_sprite_pic[sprite_id].color_mode != JO_VDP1_TEXTURE_SIZE_SHIFT_32K_COLORS &&
+        __jo_sprite_pic[sprite_id].color_mode != JO_VDP1_TEXTURE_SIZE_SHIFT_256_COLORS &&
         __jo_sprite_pic[sprite_id].color_mode != JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS)
+        return (false);
+    // (the entry given back by jo_3d_update_texture_flags() when no tile is made)
+    if ((tiles = jo_3d_tiles_for_write(sprite_id)) == JO_NULL)
         return (false);
     texture = &__jo_sprite_def[sprite_id];
     pixels = (const unsigned short *)(JO_VDP1_VRAM + JO_MULT_BY_8(texture->adr));
     if (__jo_sprite_pic[sprite_id].color_mode == JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS)
         return (jo_3d_set_texture_subdivision_4bits(sprite_id, tiles, texture, (const unsigned char *)pixels));
+    if (__jo_sprite_pic[sprite_id].color_mode == JO_VDP1_TEXTURE_SIZE_SHIFT_256_COLORS)
+        return (jo_3d_set_texture_subdivision_8bits(tiles, texture, (const unsigned char *)pixels));
     for (level = 0, n = 2; level < JO_3D_TILE_LEVELS; ++level, n *= 2)
     {
         // The width of a texture is a multiple of 8 pixels
@@ -5422,7 +5638,9 @@ bool                                        jo_3d_set_texture_subdivision_fine(c
     const unsigned char                     *pixels;
     unsigned char                           *data;
     jo_img                                  img;
+    jo_img_8bits                            img8;
     bool                                    four_bits;
+    bool                                    eight_bits;
     int                                     fw;
     int                                     th8;
     int                                     height;
@@ -5439,15 +5657,21 @@ bool                                        jo_3d_set_texture_subdivision_fine(c
     int                                     y;
     int                                     id;
 
-    if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE || !jo_3d_make_texture_subdivision(sprite_id))
+    if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE)
         return (false);
+    if (!jo_3d_make_texture_subdivision(sprite_id))
+    {
+        jo_3d_update_texture_flags(sprite_id);
+        return (false);
+    }
     // (the tiles made here: the polygon loop must know it, see jo_3d_set_texture_subdivision())
     jo_3d_update_texture_flags(sprite_id);
-    tiles = &__jo_3d_tiles[sprite_id];
+    tiles = __jo_3d_tiles[sprite_id];
     if (JO_3D_TILE_LEVEL_COUNT(tiles) != JO_3D_TILE_LEVELS)
         return (JO_3D_TILE_LEVEL_COUNT(tiles) == JO_3D_TILE_FINE_LEVELS);
     texture = &__jo_sprite_def[sprite_id];
     four_bits = __jo_sprite_pic[sprite_id].color_mode == JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS;
+    eight_bits = __jo_sprite_pic[sprite_id].color_mode == JO_VDP1_TEXTURE_SIZE_SHIFT_256_COLORS;
     // The width of the tiles in the sprite: the one of the 8 x 8 tiles, 8 pixels at least (16 for 16 colors: a line of 8
     // bytes, the unit of the addresses of the VDP1, see jo_3d_emit_near_tile()); a narrower tile has each texel repeated
     // (the VDP1 spreads the width of the tile over the line: the same place on the screen)
@@ -5457,7 +5681,7 @@ bool                                        jo_3d_set_texture_subdivision_fine(c
         return (false);
     th8 = texture->height / 8;
     height = 64 * th8 + 256 * (th8 / 2);
-    data = (unsigned char *)jo_malloc(four_bits ? fw * height / 2 : fw * height * (int)sizeof(jo_color));
+    data = (unsigned char *)jo_malloc(four_bits ? fw * height / 2 : eight_bits ? fw * height : fw * height * (int)sizeof(jo_color));
     if (data == JO_NULL)
         return (false);
     pixels = (const unsigned char *)(JO_VDP1_VRAM + JO_MULT_BY_8(texture->adr));
@@ -5484,12 +5708,21 @@ bool                                        jo_3d_set_texture_subdivision_fine(c
                             else
                                 data[(row * fw + x) >> 1] = (unsigned char)(c << 4);
                         }
+                        else if (eight_bits)
+                            data[row * fw + x] = pixels[(j * th + y) * texture->width + col];
                         else
                             ((jo_color *)data)[row * fw + x] = ((const jo_color *)pixels)[(j * th + y) * texture->width + col];
                     }
     }
     if (four_bits)
         id = __jo_sprite_add_4bits(data, fw, height, __jo_sprite_lut[sprite_id]);
+    else if (eight_bits)
+    {
+        img8.width = (unsigned short)fw;
+        img8.height = (unsigned short)height;
+        img8.data = data;
+        id = jo_sprite_add_8bits_image(&img8);
+    }
     else
     {
         img.width = fw;
@@ -5513,15 +5746,22 @@ bool                                        jo_3d_set_texture_subdivision(const 
         return (false);
     result = jo_3d_make_texture_subdivision(sprite_id);
     // (all the polygons drawn in parts, also for a texture made "near only" before: its tiles are kept)
-    __jo_3d_tiles[sprite_id].levels &= (unsigned char)~JO_3D_TILES_NEAR_ONLY;
+    if (__jo_3d_tiles[sprite_id] != JO_NULL)
+        __jo_3d_tiles[sprite_id]->levels &= (unsigned char)~JO_3D_TILES_NEAR_ONLY;
     jo_3d_update_texture_flags(sprite_id);
     return (result);
 }
 
 void                                        jo_3d_set_texture_subdivision_depth(const int sprite_id, const jo_fixed depth)
 {
-    if (sprite_id >= 0 && sprite_id < JO_MAX_SPRITE)
-        __jo_3d_tiles[sprite_id].depth = depth;
+    jo_3d_texture_tiles                     *tiles;
+
+    // (an entry for the setting even before the tiles; 0 without tiles: none)
+    if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE || (depth == 0 && __jo_3d_tiles[sprite_id] == JO_NULL) ||
+        (tiles = jo_3d_tiles_for_write(sprite_id)) == JO_NULL)
+        return;
+    tiles->depth = depth;
+    jo_3d_update_texture_flags(sprite_id);
 }
 
 void                                        jo_3d_set_fewer_parts(const bool enabled)
@@ -5531,8 +5771,14 @@ void                                        jo_3d_set_fewer_parts(const bool ena
 
 void                                        jo_3d_set_texture_subdivision_error(const int sprite_id, const int pixels)
 {
-    if (sprite_id >= 0 && sprite_id < JO_MAX_SPRITE)
-        __jo_3d_tiles[sprite_id].error = (unsigned char)JO_MIN(JO_MAX(pixels, 0), 255);
+    jo_3d_texture_tiles                     *tiles;
+
+    // (an entry for the setting even before the tiles; 0 without tiles: none)
+    if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE || (pixels <= 0 && __jo_3d_tiles[sprite_id] == JO_NULL) ||
+        (tiles = jo_3d_tiles_for_write(sprite_id)) == JO_NULL)
+        return;
+    tiles->error = (unsigned char)JO_MIN(JO_MAX(pixels, 0), 255);
+    jo_3d_update_texture_flags(sprite_id);
 }
 
 bool                                        jo_3d_set_texture_subdivision_near_only(const int sprite_id)
@@ -5540,8 +5786,11 @@ bool                                        jo_3d_set_texture_subdivision_near_o
     if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE)
         return (false);
     if (!jo_3d_make_texture_subdivision(sprite_id))
+    {
+        jo_3d_update_texture_flags(sprite_id);
         return (false);
-    __jo_3d_tiles[sprite_id].levels |= JO_3D_TILES_NEAR_ONLY;
+    }
+    __jo_3d_tiles[sprite_id]->levels |= JO_3D_TILES_NEAR_ONLY;
     jo_3d_update_texture_flags(sprite_id);
     return (true);
 }
@@ -6151,7 +6400,7 @@ static bool                                 jo_3d_draw_environment_polygon(const
             }
             // The usual polygon: on the screen, one plane, not lit, sorted on its center, a texture without tiles and smaller
             // copies (see jo_3d_subdivision.fast; jo_3d_draw_polygon_general(): not drawn in parts, not a thin line)
-            fast = k->clip_mode == 0 && ctx->front_shift < 0 && !jo_3d_is_lit(a) && __jo_3d_tiles[a->texture_id].levels == 0 &&
+            fast = k->clip_mode == 0 && ctx->front_shift < 0 && !jo_3d_is_lit(a) && !(__jo_3d_texture_flags[a->texture_id] & JO_3D_TEXTURE_HAS_TILES) &&
                    __jo_sprite_mean_color[a->texture_id] == 0 && (ctx->forced_key >= 0 || (a->sort & JO_3D_SORT_MASK) == JO_3D_SORT_CENTER);
         }
     }
@@ -6578,13 +6827,10 @@ __asm__(
 "    mov.b @(r0, r3), r0\n"
 "    tst #1, r0\n"
 "    bt 2f\n"
-"    mov r1, r0\n"                      /* (sprite x 12: the size of jo_3d_texture_tiles) */
-"    add r0, r0\n"
-"    add r1, r0\n"
-"    add r0, r0\n"
-"    add r0, r0\n"
+"    mov r1, r0\n"                      /* (sprite x 4: the pointer to its tiles, see __jo_3d_tiles) */
+"    shll2 r0\n"
 "    mov.l 20f, r1\n"
-"    add r0, r1\n"                      /* r1: the tiles of the texture (jo_3d_texture_tiles) */
+"    mov.l @(r0, r1), r1\n"             /* r1: the tiles of the texture (jo_3d_texture_tiles) */
      /* (the polygons farther than the depth of the tiles are not drawn in parts, see jo_3d_set_texture_subdivision_depth():
       * fast path (the label 2: the sort key). 0: all the polygons. They went to the slow path (the label 8) before:
       * about 260 polygons per frame of a big scene emitted by the C code, about 3 ms on each CPU) */
@@ -6774,14 +7020,11 @@ __asm__(
 "    JO3DMIPEDGE r7, r6, r11\n"
 "    JO3DMIPEDGE r4, r7, r12\n"
 "    JO3DMIPEDGE r5, r6, r12\n"
-     /* __jo_3d_mipmaps[sprite]: 20 bytes per texture (levels 0, first 2, width 4, height 8, area 12) */
-"    mov.l 23f, r2\n"
+     /* __jo_3d_mipmaps[sprite]: a pointer per texture to its copies (levels 0, first 2, width 4, height 8, area 12) */
 "    mov r1, r0\n"
 "    shll2 r0\n"
-"    mov r0, r3\n"
-"    shll2 r0\n"
-"    add r3, r0\n"
-"    add r0, r2\n"
+"    mov.l 23f, r2\n"
+"    mov.l @(r0, r2), r2\n"
 "    mul.l r11, r12\n"
 "    sts macl, r3\n"                   /* the area */
 "    mov.l @(12, r2), r0\n"            /* bigger than the half size: the texture */
@@ -6988,15 +7231,11 @@ __asm__(
 "    bra 55f\n"
 "    nop\n"
 "60:\n"
-"    mov.w @(2, r9), r0\n"               /* the tiles of the texture (sprite x 12) */
-"    extu.w r0, r1\n"
-"    mov r1, r0\n"
-"    add r0, r0\n"
-"    add r1, r0\n"
-"    add r0, r0\n"
-"    add r0, r0\n"
+"    mov.w @(2, r9), r0\n"               /* the tiles of the texture (its pointer: sprite x 4) */
+"    extu.w r0, r0\n"
+"    shll2 r0\n"
 "    mov.l 51f, r1\n"
-"    add r0, r1\n"
+"    mov.l @(r0, r1), r1\n"
 "    mov.b @r1, r0\n"
 "    tst #128, r0\n"
 "    bt 58f\n"
@@ -7580,16 +7819,19 @@ static bool                                 jo_3d_make_texture_mipmaps(const int
 
     if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE)
         return (false);
-    mip = &__jo_3d_mipmaps[sprite_id];
-    if (mip->levels != 0)
+    if (__jo_3d_mipmaps[sprite_id] != JO_NULL && __jo_3d_mipmaps[sprite_id]->levels != 0)
         return (true);
+    if (__jo_sprite_pic[sprite_id].color_mode != JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS &&
+        __jo_sprite_pic[sprite_id].color_mode != JO_VDP1_TEXTURE_SIZE_SHIFT_32K_COLORS)
+        return (false);
+    // (the entry given back by jo_3d_update_texture_flags() when no copy is made)
+    if ((mip = jo_3d_mipmaps_for_write(sprite_id)) == JO_NULL)
+        return (false);
     texture = &__jo_sprite_def[sprite_id];
     // A 16 colors texture: its copies with the same table
     if (__jo_sprite_pic[sprite_id].color_mode == JO_VDP1_TEXTURE_SIZE_SHIFT_16_COLORS)
         return (jo_3d_set_texture_mipmaps_4bits(sprite_id, mip, texture));
     // RGB textures
-    if (__jo_sprite_pic[sprite_id].color_mode != JO_VDP1_TEXTURE_SIZE_SHIFT_32K_COLORS)
-        return (false);
     source = (const jo_color *)(JO_VDP1_VRAM + JO_MULT_BY_8(texture->adr));
     levels[0] = (jo_color *)source;
     levels[1] = JO_NULL;
@@ -7643,6 +7885,36 @@ bool                                        jo_3d_set_texture_mipmaps(const int 
     result = jo_3d_make_texture_mipmaps(sprite_id);
     jo_3d_update_texture_flags(sprite_id);
     return (result);
+}
+
+bool                                        jo_3d_set_texture_mipmap_copies(const int sprite_id, const int half_id, const int levels)
+{
+    jo_3d_texture_mipmaps                   *mip;
+    const jo_texture_definition             *texture;
+    const jo_texture_definition             *copy;
+    int                                     level;
+
+    if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE || levels < 1 || levels > 2 || half_id <= sprite_id ||
+        half_id + levels - 1 > jo_get_last_sprite_id())
+        return (false);
+    if (__jo_3d_mipmaps[sprite_id] != JO_NULL && __jo_3d_mipmaps[sprite_id]->levels != 0)
+        return (false);
+    // The copies: the same color mode, half and quarter size (as made by jo_3d_set_texture_mipmaps())
+    texture = &__jo_sprite_def[sprite_id];
+    for (level = 1; level <= levels; ++level)
+    {
+        copy = &__jo_sprite_def[half_id + level - 1];
+        if (__jo_sprite_pic[half_id + level - 1].color_mode != __jo_sprite_pic[sprite_id].color_mode ||
+            copy->width != (texture->width >> level) || copy->height != (texture->height >> level))
+            return (false);
+    }
+    if ((mip = jo_3d_mipmaps_for_write(sprite_id)) == JO_NULL)
+        return (false);
+    mip->first = (unsigned short)half_id;
+    mip->levels = (unsigned char)levels;
+    jo_3d_mipmap_limits(mip, texture);
+    jo_3d_update_texture_flags(sprite_id);
+    return (true);
 }
 
 void                                        jo_3d_set_front_layer(const int shift)
@@ -8203,13 +8475,12 @@ void                                        jo_3d_init(void)
     jo_3d_display_level(JO_3D_DEFAULT_DISPLAY_LEVEL);
     for (JO_ZERO(i); i < JO_MAX_SPRITE; ++i)
     {
-        __jo_sprite_quad[i] = JO_NULL;
-        __jo_3d_tiles[i].levels = 0;
-        __jo_3d_tiles[i].error = 0;
-        __jo_3d_tiles[i].depth = 0;
-        __jo_3d_mipmaps[i].levels = 0;
+        __jo_3d_tiles[i] = JO_NULL;
+        __jo_3d_mipmaps[i] = JO_NULL;
         __jo_3d_texture_flags[i] = 0;
     }
+    jo_memset(__jo_3d_tile_pool_used, 0, sizeof(__jo_3d_tile_pool_used));
+    jo_memset(__jo_3d_mipmap_pool_used, 0, sizeof(__jo_3d_mipmap_pool_used));
 }
 
 /** @brief Convert integer vertices to fixed numbers
@@ -8663,6 +8934,25 @@ void                        jo_3d_set_mesh_polygon_texture(jo_3d_mesh * const me
     mesh->data.attributes[index].direction = JO_VDP1_DIRECTION_COMMAND(JO_VDP1_SPRITE_NO_FLIP);
 }
 
+void                        jo_3d_set_mesh_polygon_texture_bank(jo_3d_mesh * const mesh, const int sprite_id, const jo_palette * const palette,
+                                                                const int bank, const unsigned int index)
+{
+    jo_3d_polygon_attribute *attribute;
+
+#ifdef JO_DEBUG
+    if (palette == JO_NULL)
+    {
+        jo_core_error("palette is null");
+        return ;
+    }
+#endif
+    jo_3d_set_mesh_polygon_texture(mesh, sprite_id, index);
+    // (the color bank mode in place of the color lookup table: the color is the first one of the bank)
+    attribute = &mesh->data.attributes[index];
+    attribute->draw_mode = (unsigned short)((attribute->draw_mode & ~JO_VDP1_COLOR_MODE_MASK) | JO_VDP1_COLOR_MODE_16_BANK);
+    attribute->color = (unsigned short)(palette->id * 256 + bank * 16);
+}
+
 void                        jo_3d_set_mesh_texture(jo_3d_mesh * const mesh, const int sprite_id)
 {
     unsigned int            i;
@@ -8733,6 +9023,15 @@ void                        jo_3d_set_mesh_color_ex(jo_3d_mesh * const mesh, con
         jo_3d_set_mesh_polygon_color_ex(mesh, color, i, wireframe);
 }
 
+/** @brief Free the table of the quads of the sprites when it has none (see jo_3d_create_sprite_quad()) */
+static void         jo_3d_sprite_quad_table_release(void)
+{
+    if (__jo_sprite_quad == JO_NULL || __jo_sprite_quad_count != 0)
+        return ;
+    jo_free(__jo_sprite_quad);
+    __jo_sprite_quad = JO_NULL;
+}
+
 void                jo_3d_free_sprite_quad(int sprite_id)
 {
 #ifdef JO_DEBUG
@@ -8741,21 +9040,25 @@ void                jo_3d_free_sprite_quad(int sprite_id)
         jo_core_error("Invalid sprite_id (%d)", sprite_id);
         return ;
     }
-    if (__jo_sprite_quad[sprite_id] == JO_NULL)
+    if (__jo_sprite_quad == JO_NULL || __jo_sprite_quad[sprite_id] == JO_NULL)
     {
         jo_core_error("No sprite quad for sprite_id %d", sprite_id);
         return ;
     }
 #endif
-    if (__jo_sprite_quad[sprite_id] == JO_NULL)
+    if (__jo_sprite_quad == JO_NULL || __jo_sprite_quad[sprite_id] == JO_NULL)
         return ;
     jo_free(__jo_sprite_quad[sprite_id]->data.points);
     jo_free(__jo_sprite_quad[sprite_id]);
     __jo_sprite_quad[sprite_id] = JO_NULL;
+    // (the table with the last quad: allocated before it, freed after it)
+    --__jo_sprite_quad_count;
+    jo_3d_sprite_quad_table_release();
 }
 
 bool                jo_3d_create_sprite_quad(const int sprite_id)
 {
+    jo_3d_quad      *quad;
     int             img_width;
     int             img_height;
     jo_vertice      *vertices;
@@ -8763,10 +9066,23 @@ bool                jo_3d_create_sprite_quad(const int sprite_id)
     // (created already: kept, a second quad lost the first one)
     if (sprite_id < 0 || sprite_id >= JO_MAX_SPRITE)
         return (false);
-    if (__jo_sprite_quad[sprite_id] != JO_NULL)
+    if (__jo_sprite_quad != JO_NULL && __jo_sprite_quad[sprite_id] != JO_NULL)
         return (true);
-    if ((__jo_sprite_quad[sprite_id] = (jo_3d_quad *)jo_malloc_with_behaviour(sizeof(*__jo_sprite_quad[sprite_id]), JO_FAST_ALLOCATION)) == JO_NULL)
+    // The table of the quads with the first one
+    if (__jo_sprite_quad == JO_NULL)
     {
+        if ((__jo_sprite_quad = (jo_3d_quad **)jo_malloc_with_behaviour(JO_MAX_SPRITE * sizeof(*__jo_sprite_quad), JO_FAST_ALLOCATION)) == JO_NULL)
+        {
+#ifdef JO_DEBUG
+            jo_core_error("Out of memory #0");
+#endif
+            return (false);
+        }
+        jo_memset(__jo_sprite_quad, 0, JO_MAX_SPRITE * sizeof(*__jo_sprite_quad));
+    }
+    if ((quad = (jo_3d_quad *)jo_malloc_with_behaviour(sizeof(*quad), JO_FAST_ALLOCATION)) == JO_NULL)
+    {
+        jo_3d_sprite_quad_table_release();
 #ifdef JO_DEBUG
         jo_core_error("Out of memory #1");
 #endif
@@ -8774,13 +9090,15 @@ bool                jo_3d_create_sprite_quad(const int sprite_id)
     }
     if ((vertices = (jo_vertice *)jo_malloc_with_behaviour(4 * sizeof(*vertices), JO_FAST_ALLOCATION)) == JO_NULL)
     {
-        jo_free(__jo_sprite_quad[sprite_id]);
-        __jo_sprite_quad[sprite_id] = JO_NULL;
+        jo_free(quad);
+        jo_3d_sprite_quad_table_release();
 #ifdef JO_DEBUG
         jo_core_error("Out of memory #2");
 #endif
         return (false);
     }
+    __jo_sprite_quad[sprite_id] = quad;
+    ++__jo_sprite_quad_count;
     jo_3d_create_plane(__jo_sprite_quad[sprite_id], vertices);
     img_width = JO_DIV_BY_2(jo_sprite_get_width(sprite_id));
     img_height = JO_DIV_BY_2(jo_sprite_get_height(sprite_id));
@@ -9079,6 +9397,11 @@ static  __jo_force_inline bool              jo_3d_mesh_ray_hit_in(const jo_3d_me
             continue;
         // Inside of the quad (convex): the point is on the same side of the 4 edges (an edge of length 0 for a triangle).
         // (e x w).n: e x w / 16 (edges of 4000 units at most), normal Q8
+        // (the normal Q8: nx >> 6 without the call of libgcc (___ashiftrt_r4_6): the logical shift of nx + 2^31, minus
+        // 2^25, the same value)
+        nx = (int)(((unsigned int)nx + 0x80000000u) >> 6) - (1 << 25);
+        ny = (int)(((unsigned int)ny + 0x80000000u) >> 6) - (1 << 25);
+        nz = (int)(((unsigned int)nz + 0x80000000u) >> 6) - (1 << 25);
         sign = 0;
         for (j = 0; j < 4; ++j)
         {
@@ -9090,7 +9413,7 @@ static  __jo_force_inline bool              jo_3d_mesh_ray_hit_in(const jo_3d_me
             wx = qx - jo_fixed2int(a->x);
             wy = qy - jo_fixed2int(a->y);
             wz = qz - jo_fixed2int(a->z);
-            side = ((ey * wz - ez * wy) >> 4) * (nx >> 6) + ((ez * wx - ex * wz) >> 4) * (ny >> 6) + ((ex * wy - ey * wx) >> 4) * (nz >> 6);
+            side = ((ey * wz - ez * wy) >> 4) * nx + ((ez * wx - ex * wz) >> 4) * ny + ((ex * wy - ey * wx) >> 4) * nz;
             if (side == 0)
                 continue;
             if (sign == 0)

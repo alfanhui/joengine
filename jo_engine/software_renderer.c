@@ -26,8 +26,6 @@
 ** SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifdef JO_COMPILE_WITH_SOFTWARE_RENDERER_SUPPORT
-
 /*
 ** INCLUDES
 */
@@ -257,8 +255,8 @@ void                                        jo_software_renderer_clear(const jo_
 {
     register jo_color                       *ptr;
     register jo_color                       *end;
-    register unsigned int                   *ptr32;
-    register unsigned int                   *end32;
+    register __jo_uint32_alias              *ptr32;
+    register __jo_uint32_alias              *end32;
     unsigned int                            color32;
 
     ptr = gfx->color_buffer;
@@ -267,7 +265,7 @@ void                                        jo_software_renderer_clear(const jo_
     if (((unsigned int)ptr & 2) && ptr < end)
         *ptr++ = color;
     color32 = ((unsigned int)color << 16) | color;
-    ptr32 = (unsigned int *)ptr;
+    ptr32 = (__jo_uint32_alias *)ptr;
     end32 = ptr32 + JO_DIV_BY_2(end - ptr);
     while (ptr32 + 4 <= end32)
     {
@@ -1036,8 +1034,6 @@ void                                        jo_software_renderer_draw_triangle(c
         jo_sr_fill_triangle(gfx, points, t);
     }
 }
-
-#endif
 
 /*
 ** END OF FILE

@@ -204,8 +204,10 @@ typedef struct
     jo_angle        z_angle;
 }                   jo_camera;
 
-/** @brief Quadrilateral shape structure */
-typedef struct
+/** @brief Quadrilateral shape structure
+ *  @remarks Accessed as jo_3d_mesh (may alias)
+ */
+typedef struct __jo_may_alias
 {
     jo_3d_polygon_data       data;
     jo_3d_polygon_attribute        attribute;
@@ -217,10 +219,10 @@ typedef struct
     jo_3d_polygon_data       data;
 }               jo_3d_mesh;
 
-/** @brief Sprite quads (internal engine usage)
+/** @brief Sprite quads (internal engine usage): a quad per sprite, the table allocated with the first quad (JO_NULL: none)
  *  @warning MC Hammer: don't touch this
  */
-extern jo_3d_quad *__jo_sprite_quad[JO_MAX_SPRITE];
+extern jo_3d_quad **__jo_sprite_quad;
 bool    jo_3d_create_sprite_quad(const int sprite_id);
 
 
@@ -509,7 +511,7 @@ void                                jo_3d_create_triangle(jo_3d_quad * const qua
  */
 static  __jo_force_inline jo_3d_quad    *jo_3d_get_sprite_quad(const int sprite_id)
 {
-    return (__jo_sprite_quad[sprite_id] == JO_NULL && !jo_3d_create_sprite_quad(sprite_id) ? JO_NULL : __jo_sprite_quad[sprite_id]);
+    return ((__jo_sprite_quad == JO_NULL || __jo_sprite_quad[sprite_id] == JO_NULL) && !jo_3d_create_sprite_quad(sprite_id) ? JO_NULL : __jo_sprite_quad[sprite_id]);
 }
 
 /** @brief Delete sprite quad
@@ -533,6 +535,18 @@ void                                    jo_3d_free_sprite_quad(const int sprite_
  *  @param index polygon index on the mesh
  */
 void                                jo_3d_set_mesh_polygon_texture(jo_3d_mesh * const mesh, const int sprite_id, const unsigned int index);
+
+/** @brief Set a texture of 16 colors on one polygon, its colors taken in a bank of 16 colors of a palette (in place of its
+ *  color lookup table): a polygon of the palette lighting (see jo_3d_set_palette_light()), or opaque over the half
+ *  transparent water (the MSB of the colors of the palette cleared), or the same texture in other colors
+ *  @param mesh Address to a jo_3d_mesh allocated struct
+ *  @param sprite_id Sprite ID (16 colors: jo_sprite_add_4bits_lut(), jo_sprite_add_image_4bits_lut())
+ *  @param palette Palette (jo_create_palette())
+ *  @param bank Bank of 16 colors in the palette: 0 to 15 (the pixel of index i: the color bank * 16 + i of the palette)
+ *  @param index polygon index on the mesh
+ */
+void                                jo_3d_set_mesh_polygon_texture_bank(jo_3d_mesh * const mesh, const int sprite_id, const jo_palette * const palette,
+                                                                        const int bank, const unsigned int index);
 
 /** @brief Set a texture on the mesh
  *  @param mesh Address to a jo_3d_mesh allocated struct
@@ -596,7 +610,7 @@ static  __jo_force_inline void      jo_3d_set_palette(jo_3d_quad * const quad, c
  */
 static  __jo_force_inline bool      jo_3d_set_sprite_palette(const int sprite_id, const int palette_id)
 {
-    if (__jo_sprite_quad[sprite_id] == JO_NULL && !jo_3d_create_sprite_quad(sprite_id)) return (false);
+    if ((__jo_sprite_quad == JO_NULL || __jo_sprite_quad[sprite_id] == JO_NULL) && !jo_3d_create_sprite_quad(sprite_id)) return (false);
     jo_3d_set_palette(__jo_sprite_quad[sprite_id], palette_id);
     return (true);
 }
@@ -903,9 +917,9 @@ static  __jo_force_inline void      jo_3d_rotate_matrix_z(short z)
  */
 static  __jo_force_inline void      jo_3d_rotate_matrix_rad(float x, float y, float z)
 {
-    __jo_3d_rotate(JO_3D_AXIS_X, JO_RAD_TO_ANGLE(x));
-    __jo_3d_rotate(JO_3D_AXIS_Y, JO_RAD_TO_ANGLE(y));
-    __jo_3d_rotate(JO_3D_AXIS_Z, JO_RAD_TO_ANGLE(z));
+    __jo_3d_rotate(JO_3D_AXIS_X, jo_fixed_rad2ANGLE(jo_float2fixed(x)));
+    __jo_3d_rotate(JO_3D_AXIS_Y, jo_fixed_rad2ANGLE(jo_float2fixed(y)));
+    __jo_3d_rotate(JO_3D_AXIS_Z, jo_fixed_rad2ANGLE(jo_float2fixed(z)));
 }
 
 /** @brief Rotate 3D matrix using radian (X axis)
@@ -913,7 +927,7 @@ static  __jo_force_inline void      jo_3d_rotate_matrix_rad(float x, float y, fl
  */
 static  __jo_force_inline void      jo_3d_rotate_matrix_rad_x(float x)
 {
-    __jo_3d_rotate(JO_3D_AXIS_X, JO_RAD_TO_ANGLE(x));
+    __jo_3d_rotate(JO_3D_AXIS_X, jo_fixed_rad2ANGLE(jo_float2fixed(x)));
 }
 
 /** @brief Rotate 3D matrix using radian (Y axis)
@@ -921,7 +935,7 @@ static  __jo_force_inline void      jo_3d_rotate_matrix_rad_x(float x)
  */
 static  __jo_force_inline void      jo_3d_rotate_matrix_rad_y(float y)
 {
-    __jo_3d_rotate(JO_3D_AXIS_Y, JO_RAD_TO_ANGLE(y));
+    __jo_3d_rotate(JO_3D_AXIS_Y, jo_fixed_rad2ANGLE(jo_float2fixed(y)));
 }
 
 /** @brief Rotate 3D matrix using radian (Z axis)
@@ -929,7 +943,7 @@ static  __jo_force_inline void      jo_3d_rotate_matrix_rad_y(float y)
  */
 static  __jo_force_inline void      jo_3d_rotate_matrix_rad_z(float z)
 {
-    __jo_3d_rotate(JO_3D_AXIS_Z, JO_RAD_TO_ANGLE(z));
+    __jo_3d_rotate(JO_3D_AXIS_Z, jo_fixed_rad2ANGLE(jo_float2fixed(z)));
 }
 
 /** @brief Rotate 3D matrix using jo_angle (0x10000 = 360 degrees: a fraction of degree, no float)
@@ -986,7 +1000,7 @@ static  __jo_force_inline void      jo_3d_rotate_matrix_angle_z(const jo_angle z
  */
 static  __jo_force_inline void      jo_3d_translate_matrixf(float x, float y, float z)
 {
-    __jo_3d_translate(JO_FLOAT_TO_FIXED(x), JO_FLOAT_TO_FIXED(y), JO_FLOAT_TO_FIXED(z));
+    __jo_3d_translate(jo_float2fixed(x), jo_float2fixed(y), jo_float2fixed(z));
 }
 
 /** @brief Translate 3D matrix
@@ -1074,6 +1088,27 @@ static  __jo_force_inline bool      jo_3d_mesh_draw_ranges(const jo_3d_mesh * co
     return (__jo_3d_draw_ranges(&mesh->data, point_count, ranges, range_count));
 }
 
+/** @brief Add polygons to a list of ranges (see jo_3d_mesh_draw_ranges()): joined to the last range when they follow it
+ *  @param ranges Ranges (room for one more)
+ *  @param range_count Number of ranges (updated)
+ *  @param first First polygon
+ *  @param count Number of polygons (0 or less: nothing added)
+ */
+static  __jo_force_inline void      jo_3d_add_polygon_range(jo_3d_polygon_range * const ranges, int * const range_count, const int first,
+                                                            const int count)
+{
+    if (count <= 0)
+        return;
+    if (*range_count > 0 && ranges[*range_count - 1].first + ranges[*range_count - 1].count == first)
+    {
+        ranges[*range_count - 1].count += (unsigned short)count;
+        return;
+    }
+    ranges[*range_count].first = (unsigned short)first;
+    ranges[*range_count].count = (unsigned short)count;
+    ++*range_count;
+}
+
 /** @brief Get polygon count on the mesh
  *  @param mesh Address to a jo_3d_mesh allocated struct
  *  @return polygon count
@@ -1114,7 +1149,7 @@ static  __jo_force_inline void      jo_3d_draw_array(jo_3d_quad * const array, i
  */
 static  __jo_force_inline bool      jo_3d_draw_sprite(const int sprite_id)
 {
-    if (__jo_sprite_quad[sprite_id] == JO_NULL && !jo_3d_create_sprite_quad(sprite_id)) return (false);
+    if ((__jo_sprite_quad == JO_NULL || __jo_sprite_quad[sprite_id] == JO_NULL) && !jo_3d_create_sprite_quad(sprite_id)) return (false);
     jo_3d_draw(__jo_sprite_quad[sprite_id]);
     return (true);
 }
@@ -1188,7 +1223,7 @@ static  __jo_force_inline void      jo_3d_draw_scaled_billboard(const int sprite
  */
 static  __jo_force_inline void      jo_3d_set_scalef(const float x, const float y, const float z)
 {
-    __jo_3d_scale(JO_FLOAT_TO_FIXED(x), JO_FLOAT_TO_FIXED(y), JO_FLOAT_TO_FIXED(z));
+    __jo_3d_scale(jo_float2fixed(x), jo_float2fixed(y), jo_float2fixed(z));
 }
 
 /** @brief Change scale
@@ -1602,7 +1637,8 @@ jo_3d_mesh                          *jo_3d_create_indexed_mesh(const unsigned in
 
 /** @brief Draw the polygons that use a texture in parts when they are near the camera (2 x 2 or 4 x 4 parts, each part
  *  with its tile of the texture)
- *  @param sprite_id Texture (RGB sprite, width multiple of 16: 2 x 2 tiles, of 32: 4 x 4 tiles too)
+ *  @param sprite_id Texture (RGB, 256 colors or 16 colors sprite, width multiple of 16: 2 x 2 tiles, of 32: 4 x 4 tiles
+ *  too; a 256 colors tile is drawn with the bank of the polygon: its palette)
  *  @return true if the tiles were created
  *  @remarks The VDP1 maps a texture without perspective: a big polygon near the camera (a wall, the ground) is distorted,
  *  and the parts of a polygon clipped by the near plane get the whole texture. In parts, each part keeps its piece of the
@@ -1622,11 +1658,11 @@ bool                                jo_3d_set_texture_subdivision(const int spri
  *  its texture is squeezed by up to a tile, 8 texels of a 32 x 32 texture with the 4 x 4 tiles, 2 with the 16 x 16 tiles.
  *  For a texture magnified near the camera (texels of more than about 10 pixels: a texture of a few texels on a big wall,
  *  a big floor)
- *  @param sprite_id Texture (RGB or 16 colors sprite, width and height multiples of 16)
+ *  @param sprite_id Texture (RGB, 256 colors or 16 colors sprite, width and height multiples of 16)
  *  @return true if the tiles were created (with the 2 x 2 and 4 x 4 tiles if they were not)
  *  @remarks One more sprite, the tiles one under the other, 1/8 of the width of the texture and at least 8 pixels wide (16 for
- *  16 colors: a narrower tile has its texels repeated): 3 times the VRAM of the texture (64 pixels wide and more, RGB; 128,
- *  16 colors), 6 times for a 32 x 32 RGB texture. More parts near the camera (CPU time, VDP1 commands)
+ *  16 colors: a narrower tile has its texels repeated): 3 times the VRAM of the texture (64 pixels wide and more, RGB and
+ *  256 colors; 128, 16 colors), 6 times for a 32 x 32 RGB texture. More parts near the camera (CPU time, VDP1 commands)
  */
 bool                                jo_3d_set_texture_subdivision_fine(const int sprite_id);
 
@@ -1676,6 +1712,20 @@ void                                jo_3d_set_fewer_parts(const bool enabled);
  *  its lines along the whole polygon (about the square of its length in pixels, 10 to 20 % of a frame on a hilly ground)
  */
 bool                                jo_3d_set_texture_mipmaps(const int sprite_id);
+
+/** @brief Give a texture its smaller copies made beforehand (see jo_3d_set_texture_mipmaps()): for the textures it can't
+ *  reduce itself (256 colors: their palette is chosen per polygon), or reduced better by a tool (the averages in the colors
+ *  of the palette, a mean color searched among 255 at the loading took seconds)
+ *  @param sprite_id Texture
+ *  @param half_id The copy of half size (width and height), added after the texture; the copy of quarter size: the sprite
+ *  after it
+ *  @param levels 1: the half size only, 2: the half and quarter sizes
+ *  @return false if the copies are not of the color mode of the texture, not of its half and quarter sizes, or if it has
+ *  copies already
+ *  @remarks Drawn with the bank of the polygon (a 256 colors copy: its palette). A thin polygon far away is not drawn of
+ *  the mean color of these textures (see jo_3d_set_texture_mipmaps(): no mean color is known)
+ */
+bool                                jo_3d_set_texture_mipmap_copies(const int sprite_id, const int half_id, const int levels);
 
 #ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
 

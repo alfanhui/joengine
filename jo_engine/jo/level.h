@@ -30,7 +30,7 @@
  *
  *  @brief Levels (.JOL files): the data of a level of a game (terrain, models, plants, decals...), see
  *         Documentation/level_format.md. The files are written by the Python tools of Compiler/COMMON/jo_level
- *  @remarks Module JO_COMPILE_WITH_LEVEL_MODULE = 1 in the makefile
+ *  @remarks With the file system module (JO_COMPILE_WITH_FS_MODULE, on by default: the levels are files)
  *  @remarks The file is read once and used as it is (big endian, aligned): a section is a pointer in the file. A header
  *           or records of an older version (smaller) are copied with the default values of the missing fields
  *           (jo_level_get_header(), jo_level_get_records())
@@ -39,7 +39,7 @@
 #ifndef __JO_LEVEL_H__
 # define __JO_LEVEL_H__
 
-#ifdef JO_COMPILE_WITH_LEVEL_SUPPORT
+#ifdef JO_COMPILE_WITH_FS_SUPPORT
 
 # include "level_format.h"
 
@@ -131,7 +131,37 @@ const char                          *jo_level_string(const jo_level * const leve
                                                (const jo_level_##NAME##_record *)jo_level_get_records((LEVEL), JO_LEVEL_SECTION_##ID, \
                                                sizeof(jo_level_##NAME##_record), &__defaults, (COUNT)); })
 
-#endif /* !JO_COMPILE_WITH_LEVEL_SUPPORT */
+/*
+** Textures of 16 colors (section TX16): 4 bits a pixel, 4 times less VRAM than RGB. A level (or a file of textures) gives
+** the palette and the pixels; the game makes its sprites when it starts and frees the file: the textures are not in the
+** program. The fields of the game (TX16.value) and the sizes: JO_LEVEL_RECORDS(level, TX16, tx16, &count)
+*/
+
+/** @brief Copy the palette of the textures of 16 colors of a level in a palette
+ *  @param level Level
+ *  @param palette Palette (jo_create_palette()): its color n is the color n of the textures (palette->data[n - 1])
+ *  @return false if the level has no textures of 16 colors, or no colors, or more than JO_PALETTE_MAX_COLORS
+ */
+bool                                jo_level_set_textures16_palette(jo_level * const level, const jo_palette * const palette);
+
+/** @brief Make the sprites of textures of 16 colors of a level, each one with its color lookup table
+ *  @param level Level
+ *  @param palette JO_NULL: tables of RGB colors (the colors of the textures with their MSB set: drawn like RGB textures,
+ *  gouraud shading, half transparency); a palette (see jo_level_set_textures16_palette()): tables of its color codes
+ *  (the pixels have the colors of the color RAM: opaque over a see-through bottom where their MSB is cleared, see
+ *  jo_vdp2_blend_rgb_sprites_only(); the blend ratio of each pixel value, see jo_vdp2_set_sprite_blend_ratios())
+ *  @param first First texture (0: the first one of the level)
+ *  @param count Number of textures
+ *  @param sprite_ids Output: the sprite Id of each texture (count values)
+ *  @return false if the level has not these textures (or a texture is damaged: nothing made) or if the VDP1 memory is full
+ *  (the sprites already made stay, see jo_sprite_free_from())
+ *  @remarks A texture whose pixel value v is the color bank x 16 + v of the palette can also be drawn with its bank:
+ *  jo_3d_set_mesh_polygon_texture_bank() (its table is not used)
+ */
+bool                                jo_level_add_textures16(jo_level * const level, const jo_palette * const palette,
+                                                            const int first, const int count, int * const sprite_ids);
+
+#endif /* !JO_COMPILE_WITH_FS_SUPPORT */
 
 #endif /* !__JO_LEVEL_H__ */
 

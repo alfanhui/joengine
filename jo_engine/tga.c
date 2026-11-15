@@ -229,6 +229,13 @@ t_tga_error_code                            __jo_tga_load(jo_raw_img *img, const
 #endif /* !JO_COMPILE_WITH_FS_SUPPORT */
     if (*stream == JO_NULL)
         return (JO_TGA_UNSUPPORTED_FORMAT);
+    // (a file shorter than a header: its fields were read after its end)
+    if (len > 0 && (unsigned int)len < sizeof(*header))
+    {
+        if (filename != JO_NULL)
+            jo_free(*stream);
+        return (JO_TGA_UNSUPPORTED_FORMAT);
+    }
     header = (__jo_tga_header *)*stream;
     img->width = jo_swap_endian_short(header->width);
     img->height = jo_swap_endian_short(header->height);
@@ -237,7 +244,11 @@ t_tga_error_code                            __jo_tga_load(jo_raw_img *img, const
     // (1 color mapped, 2 true color, 3 gray; 9 to 11: the same compressed (RLE), see jo_tga_rle_unpack())
     // (a file shorter than its header says, or than a header: the pixels were read after its end. Compressed: the pixels
     // stop at the end of the file)
+    // (the colors of a palette: 2, 3 or 4 bytes (15 or 16, 24, 32 bits). Another size of a damaged header: read as 3 bytes
+    // each, after the bytes checked below)
     if (!JO_TGA_SUPPORTED_FORMAT(*bits) || (header->image_type & ~JO_TGA_RLE) < 1 || (header->image_type & ~JO_TGA_RLE) > 3 ||
+        (*bits == JO_TGA_8_BITS && header->color_map_length != 0 &&
+         (JO_DIV_BY_8(header->color_map_entry_depth + 1) < 2 || JO_DIV_BY_8(header->color_map_entry_depth + 1) > 4)) ||
         (len > 0 && ((unsigned int)len < sizeof(*header) ||
                      (unsigned long long)len < sizeof(*header) + header->id_length +
                      (*bits == JO_TGA_8_BITS ? (unsigned long long)(unsigned short)jo_swap_endian_short(header->color_map_length) * JO_DIV_BY_8(header->color_map_entry_depth + 1) : 0) +
@@ -369,7 +380,10 @@ static char                             *jo_tga_tileset_pixels(char * const file
     *block = file;
     if (!(((__jo_tga_header *)file)->image_type & JO_TGA_RLE))
         return (pixels);
-    unpacked = (char *)jo_malloc(img->width * img->height * JO_DIV_BY_8(bits));
+    // (the size in 64 bits, with the limit of the images (see __jo_tga_load()): a damaged header wrapped it to a small block,
+    // then filled with the whole picture)
+    unpacked = (unsigned long long)img->width * img->height * JO_DIV_BY_8(bits) < 0x01000000ull ?
+               (char *)jo_malloc(img->width * img->height * JO_DIV_BY_8(bits)) : JO_NULL;
     if (unpacked != JO_NULL)
     {
         rle.src = (const unsigned char *)pixels;
@@ -438,11 +452,21 @@ t_tga_error_code		    jo_tga_loader(jo_img *img, const char * const sub_dir, con
 bool                        jo_set_background_tga(const char * const sub_dir, const char * const filename, const jo_color transparent_color)
 {
     jo_img                  img;
+    int                     bits;
 
     img.data = JO_NULL;
     // (the pixels are allocated after the checks of the file: nothing to free when it fails)
-    if (jo_tga_loader(&img, sub_dir, filename, transparent_color) != JO_TGA_OK)
+    if (__jo_tga_any_loader((jo_raw_img *)&img, sub_dir, filename, transparent_color, &bits) != JO_TGA_OK)
         return (false);
+    // (a 8 bits image: a byte per pixel, the background read 2 per pixel, after the end of the image)
+    if (bits == JO_TGA_8_BITS)
+    {
+#ifdef JO_DEBUG
+        jo_core_error("%s: 8 bits TGA not supported", filename);
+#endif
+        jo_free_img(&img);
+        return (false);
+    }
     jo_vdp2_set_nbg1_image(&img, 0, 0);
     jo_free_img(&img);
     return (true);

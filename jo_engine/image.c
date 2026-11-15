@@ -58,15 +58,15 @@ extern int      __jo_hash_table[JO_MAX_SPRITE];
  */
 static void             jo_bin_copy_pixels(jo_color *dest, const unsigned short *src, int size, const jo_color transparent_color)
 {
-    unsigned int        *d32;
-    const unsigned int  *s32;
+    __jo_uint32_alias       *d32;
+    const __jo_uint32_alias *s32;
     unsigned int        w;
     register int        i;
 
     if ((((unsigned int)dest | (unsigned int)src) & 3) == 0)
     {
-        d32 = (unsigned int *)dest;
-        s32 = (const unsigned int *)src;
+        d32 = (__jo_uint32_alias *)dest;
+        s32 = (const __jo_uint32_alias *)src;
         for (i = size >> 1; i > 0; --i)
         {
             w = *s32++;
@@ -97,10 +97,21 @@ static void             jo_bin_copy_pixels(jo_color *dest, const unsigned short 
 unsigned short      *__jo_bin_load(jo_img *img, const char * const sub_dir, const char * const filename)
 {
     unsigned short  *stream;
+    int             len;
 
-    stream = (unsigned short *)jo_fs_read_file_in_dir(filename, sub_dir, JO_NULL);
+    stream = (unsigned short *)jo_fs_read_file_in_dir(filename, sub_dir, &len);
     if (stream == JO_NULL)
         return (JO_NULL);
+    // (a file shorter than its header and its pixels, truncated or not a BIN image: the pixels were read after the end of
+    // its buffer)
+    if (len < 4 || (unsigned int)jo_swap_endian_ushort(*stream) * jo_swap_endian_ushort(*(stream + 1)) > (unsigned int)(len - 4) / 2)
+    {
+#ifdef JO_DEBUG
+        jo_core_error("%s: Bad BIN image", filename);
+#endif
+        jo_free(stream);
+        return (JO_NULL);
+    }
     img->width = jo_swap_endian_ushort(*stream);
     img->height = jo_swap_endian_ushort(*(stream + 1));
     if (img->data == JO_NULL)

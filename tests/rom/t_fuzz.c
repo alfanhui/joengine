@@ -787,7 +787,7 @@ static void                 t_fuzz_files_map(void)
     jt_value("fuzz.files_map.accepted", (unsigned int)state.accepted);
 }
 
-#ifdef JO_COMPILE_WITH_LEVEL_SUPPORT
+#ifdef JO_COMPILE_WITH_FS_SUPPORT
 
 /** @brief The sections with records and the size of their records */
 static const unsigned int   t_level_sections[][2] =
@@ -862,7 +862,7 @@ static void                 t_fuzz_files_jol(void)
     jt_value("fuzz.files_jol.accepted", (unsigned int)state.accepted);
 }
 
-#endif /* JO_COMPILE_WITH_LEVEL_SUPPORT */
+#endif /* JO_COMPILE_WITH_FS_SUPPORT */
 
 /*
 ** APIs
@@ -910,13 +910,16 @@ static void                 t_api_vdp2_malloc_sizes(void)
  *  textures (the size of the texture was masked with 0x7FFE0 by the check of the free memory) */
 /** @brief The VDP1 memory after the area of the textures (the gouraud tables): saved before a texture that may be written
  *  after the end of the area */
-static unsigned int         t_vdp1_saved[(0x80000 - (JO_VDP1_USER_AREA_END_ADDR - JO_VDP1_VRAM)) / 4];
+#define T_VDP1_SAVED_WORDS          ((0x80000 - (JO_VDP1_USER_AREA_END_ADDR - JO_VDP1_VRAM)) / 4)
+_Static_assert(T_VDP1_SAVED_WORDS * 4 <= JT_LOW_RAM_VDP1_SAVED_SIZE, "the VDP1 memory saved overlaps the next buffer");
+/* (in the low work RAM, see JT_LOW_RAM_VDP1_SAVED) */
+static unsigned int * const t_vdp1_saved = JT_LOW_RAM_VDP1_SAVED;
 
 static void                 t_vdp1_save(const bool restore)
 {
     unsigned int            k;
 
-    for (k = 0; k < JT_COUNT(t_vdp1_saved); ++k)
+    for (k = 0; k < T_VDP1_SAVED_WORDS; ++k)
         if (restore)
             ((volatile unsigned int *)JO_VDP1_USER_AREA_END_ADDR)[k] = t_vdp1_saved[k];
         else
@@ -1377,7 +1380,7 @@ static void                 t_fixed_crashes(void)
         if (T_FUZZ_KNOWN_BUGS != 0 && T_FUZZ_KNOWN_BUGS != 10 + k)
             continue;
         t_progress(names[k], k);
-#ifdef JO_COMPILE_WITH_LEVEL_SUPPORT
+#ifdef JO_COMPILE_WITH_FS_SUPPORT
         if (k >= 3)
         {
             // A section with a record_size of 0: jo_level_get_records() of a record of 24 bytes (an older engine)
@@ -1449,7 +1452,7 @@ void                        t_fuzz(void)
     t_fuzz_files_tga();
     t_fuzz_files_wav();
     t_fuzz_files_map();
-#ifdef JO_COMPILE_WITH_LEVEL_SUPPORT
+#ifdef JO_COMPILE_WITH_FS_SUPPORT
     t_fuzz_files_jol();
 #endif
     jo_clear_screen_line(27);
