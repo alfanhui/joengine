@@ -38,6 +38,7 @@
 #include "jo/malloc.h"
 #include "jo/smpc.h"
 #include "jo/core.h"
+#include "internal/core.h"
 
 #define JO_BLOCK_FREE           (~0)
 
@@ -56,12 +57,12 @@ typedef struct
     unsigned char       *end;
     unsigned char       *first_free;    // A block at or before the first free block of the zone (the search of a free
                                         // block starts there: from the start, it went through all the blocks in use, about
-                                        // 2 % of the loading of a track of the rally demo)
+                                        // 2 % of the loading of a level of a 3D game)
 }                       jo_memory_zone;
 
 static jo_memory_zone   memory_zones[JO_MALLOC_MAX_MEMORY_ZONE];
 
-void                    jo_add_memory_zone(unsigned char *ptr, const unsigned int size_in_bytes)
+void                    jo_add_memory_zone(unsigned char *ptr, unsigned int size_in_bytes)
 {
 #ifdef JO_DEBUG
     if (__jo_memory_zone_index >= JO_MALLOC_MAX_MEMORY_ZONE)
@@ -70,6 +71,19 @@ void                    jo_add_memory_zone(unsigned char *ptr, const unsigned in
         return ;
     }
 #endif
+    // (the functions of the low work RAM (JO_LOW_WORK_RAM_CODE, see jo.linker): a zone that starts on them starts after
+    // them, a game that gives the low work RAM from 0x00200000 keeps working)
+    if (((unsigned int)ptr & 0x0FFFFFFF) < ((unsigned int)JO_LOW_WORK_RAM_FREE & 0x0FFFFFFF) &&
+        ((unsigned int)ptr & 0x0FFFFFFF) + size_in_bytes > JO_WORK_RAM_LOW)
+    {
+        unsigned int    skipped;
+
+        skipped = ((((unsigned int)JO_LOW_WORK_RAM_FREE & 0x0FFFFFFF) + 3u) & ~3u) - ((unsigned int)ptr & 0x0FFFFFFF);
+        if (skipped >= size_in_bytes)
+            return ;
+        ptr += skipped;
+        size_in_bytes -= skipped;
+    }
     memory_zones[__jo_memory_zone_index].begin = ptr;
     memory_zones[__jo_memory_zone_index].high = ptr;
     memory_zones[__jo_memory_zone_index].first_free = ptr;
@@ -180,6 +194,18 @@ static jo_memory_block  *jo_malloc_new_block(const int zone, const unsigned int 
     return (block);
 }
 
+#ifdef JO_DEBUG
+
+/** @brief Check if the memory is used from the slave CPU or from an interrupt (a VBLANK callback): the blocks of the zones
+ *  are not shared, a jo_malloc() or a jo_free() in the middle of one of the master CPU broke them (any crash later)
+ *  @return true with the error (in the function that uses it) if so
+ */
+# define JO_MALLOC_WRONG_CONTEXT() \
+    ((__jo_core_on_slave_cpu() && (jo_core_error("Not on the slave CPU (only the master CPU allocates)"), true)) || \
+     ((__jo_core_get_sr() & JO_SH2_SR_INTERRUPT_MASK) != 0 && (jo_core_error("Not in an interrupt (a VBLANK callback)"), true)))
+
+#endif
+
 void	                *jo_malloc_with_behaviour(unsigned int n, const jo_malloc_behaviour behaviour)
 {
     register int        zone;
@@ -191,6 +217,8 @@ void	                *jo_malloc_with_behaviour(unsigned int n, const jo_malloc_b
         jo_core_error("n must be greater than zero");
         return (JO_NULL);
     }
+    if (JO_MALLOC_WRONG_CONTEXT())
+        return (JO_NULL);
 #endif
     // (a huge size, a negative number given as a size: n + the header wrapped around, a block smaller than its header)
     if (n > 0xFFFFFFFFu - sizeof(*block) - 3)
@@ -249,15 +277,17 @@ inline void                     jo_free(const void * const p)
     jo_memory_block             *block;
     jo_memory_zone              *zone;
 
-#ifdef JO_DEBUG
     if (p == JO_NULL)
     {
+#ifdef JO_DEBUG
         jo_core_error("Null pointer");
+#endif
         return ;
     }
-#endif
     block = ((jo_memory_block *)p) - 1;
 #ifdef JO_DEBUG
+    if (JO_MALLOC_WRONG_CONTEXT())
+        return ;
     if (block->size == 0 || JO_MOD_POW2(block->size, 4) != 0)
     {
         jo_core_error("Bad pointer: %x", (unsigned int)p);

@@ -73,3 +73,15 @@ that makes the engine objectively better goes back to it, not only into our copy
 ## Learnings
 
 Read `SKILLS.md` (next to this file) at the start of every session: build and test commands, tool quirks, Saturn/SGL facts and mistakes already made. Add to it whenever something takes time to find out.
+
+## jo-engine's own guide (upstream, since 2026-11-18)
+
+jo's author ships instructions for coding assistants. They come in with the engine, and apply to
+CircuitBreaker too: they're the engine's own rules (its API index, its tools, its performance
+rules). Our `SKILLS.md` holds what's specific to this game and what we've measured on top.
+
+@AGENTS.md
+
+Writing, porting or optimizing on the engine: the skill `jo-engine` (`.claude/skills/jo-engine/SKILL.md`
+and its references: performance, 3D, assets, porting, diagnosis) has the details. Read it before
+starting, and `SKILLS.md`'s "Where to look first" for which of its parts and ours to read for a task.

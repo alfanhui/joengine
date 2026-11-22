@@ -90,6 +90,8 @@
 # define JO_VDP1_VRAM               (0x25C00000)
 /** @brief VDP1 Frame buffer (256 kilobytes) */
 # define JO_VDP1_FB                 (0x25C80000)
+/** @brief Width of a line of the VDP1 frame buffer (pixels, 16 bits per pixel), whatever the width of the screen */
+# define JO_VDP1_FB_WIDTH           (512)
 /** @brief VDP1 I/O register address */
 # define JO_VDP1_REG                (0x25D00000)
 /** @brief Last VDP1 I/O register address */
@@ -149,6 +151,10 @@
 # define JO_VDP2_VRAM_B1            (0x25E60000)
 /** @brief VDP2 Color RAM (4 kilobytes) */
 # define JO_VDP2_CRAM               (0x25F00000)
+/** @brief Define the maximum of palette (the 256 colors palettes of the color RAM)
+ *  @warning MC Hammer: don't touch this
+ */
+# define JO_PALETTE_MAX             (8)
 /** @brief VDP2 VRAM Bank size (128 kilobytes) */
 # define JO_VDP2_BANK_SIZE          (0x20000)
 
@@ -463,6 +469,24 @@ extern unsigned int                             _jo_work_start;
 /** @brief A-bus refresh for the extended RAM cartridge (JO_SCU_AREF) */
 # define JO_RAM_CARTRIDGE_AREF                  (0x00000013)
 
+/** @brief A function read rarely (the loading, the creation of the objects, the menus) run from the low work RAM when the
+ *  makefile has JO_COMPILE_WITH_LOW_WORK_RAM_CODE = 1 (off by default): the high work RAM it leaves goes to jo_malloc()
+ *  (the data read at each frame: a read from the low work RAM takes about twice the time); else nothing changes
+ *  @remarks Example: JO_LOW_WORK_RAM_CODE void load_level(int k) { ... }. Not for a function called at each frame: the
+ *  instructions read from the low work RAM are slower too (the cache of the CPU keeps a small loop)
+ *  @remarks The low work RAM free starts at JO_LOW_WORK_RAM_FREE, not at JO_WORK_RAM_LOW: jo_add_memory_zone() skips the
+ *  functions there by itself, a program that writes in the low work RAM by itself must start at JO_LOW_WORK_RAM_FREE
+ */
+#ifdef JO_COMPILE_WITH_LOW_WORK_RAM_CODE
+# define JO_LOW_WORK_RAM_CODE                   __attribute__((section("JO_LOW_WORK_RAM"), noinline))
+#else
+# define JO_LOW_WORK_RAM_CODE
+#endif
+/** @brief The end of the functions JO_LOW_WORK_RAM_CODE in the low work RAM (see jo.linker): the low work RAM free after it
+ *  (JO_WORK_RAM_LOW without JO_COMPILE_WITH_LOW_WORK_RAM_CODE) */
+extern unsigned char                            __jo_low_work_ram_end[];
+# define JO_LOW_WORK_RAM_FREE                   ((unsigned char *)__jo_low_work_ram_end)
+
 /** @brief Put a variable in the engine work area (not cleared by the program loader, cleared at startup) */
 # define JO_WORK_RAM_ENGINE_WORK_SECTION        __attribute__((section("JO_WORK")))
 /** @brief Engine work area, for a buffer aligned on a big boundary (placed first: no hole in the work area) */
@@ -516,6 +540,16 @@ extern unsigned int                             _jo_work_start;
 # define JO_SCU_DMA_MODE_INDIRECT   (0x01000007)
 /** @brief SCU DMA indirect table: end of the table (read address of the last transfer) */
 # define JO_SCU_DMA_INDIRECT_END    (0x80000000)
+/** @brief SCU DMA indirect table: words of a transfer (byte count, write address, read address) */
+# define JO_SCU_DMA_INDIRECT_WORDS  (3)
+/** @brief SCU DMA add: read address + 4, write address + 4 (A-bus, work RAM) */
+# define JO_SCU_DMA_ADD_READ4_WRITE4    (0x102)
+/** @brief SCU DMA enable: enabled, started by its start factor (see the modes below) */
+# define JO_SCU_DMA_ENABLE_ONLY     (0x100)
+/** @brief SCU DMA mode: indirect mode, started when the VDP1 ends its drawing (start factor "sprite draw end") */
+# define JO_SCU_DMA_MODE_INDIRECT_SPRITE_END    (0x01000006)
+/** @brief Address of a memory for the SCU DMA: its physical address (without the cache bits) */
+# define JO_SCU_ADDRESS(ADDR)       ((unsigned int)(ADDR) & 0x07FFFFFF)
 
 /** @brief SCU interrupt mask bits */
 # define JO_SCU_INT_VBLANK_IN       (1 << 0)
@@ -555,6 +589,24 @@ extern unsigned int                             _jo_work_start;
 # define JO_SH2_CCR_CACHE_ENABLE    (1 << 0)
 /** @brief CCR: cache purge (all entries invalidated) */
 # define JO_SH2_CCR_CACHE_PURGE     (1 << 4)
+
+/** @brief A variable shared by the 2 CPU, read or written through its cache-through mirror (each CPU has its own cache:
+ *  a value the other CPU wrote may be older in it): JO_SHARED(count) += 1;
+ *  @param VAR Variable (an lvalue) */
+# define JO_SHARED(VAR)             (*(volatile __typeof__(VAR) *)JO_CACHE_THROUGH(&(VAR)))
+
+/** @brief Purge the whole cache of the CPU that calls it: the data the other CPU wrote are read again from the memory
+ *  (the cache is write-through: nothing is lost; the cache is disabled while it is purged)
+ *  @remarks About 4 KB of data (tables, code) read again into the cache after it */
+static  __jo_force_inline void      jo_cpu_cache_purge(void)
+{
+    unsigned char                   ccr;
+
+    ccr = JO_SH2_CCR;
+    JO_SH2_CCR = (unsigned char)(ccr & ~JO_SH2_CCR_CACHE_ENABLE);
+    JO_SH2_CCR = (unsigned char)((ccr & ~JO_SH2_CCR_CACHE_ENABLE) | JO_SH2_CCR_CACHE_PURGE);
+    JO_SH2_CCR = ccr;
+}
 /** @brief Status register: interrupt mask bits (level 15 = all interrupts masked) */
 # define JO_SH2_SR_INTERRUPT_MASK   (0xF0)
 /** @brief Status register: all interrupts enabled */
@@ -625,6 +677,8 @@ extern unsigned int                             _jo_work_start;
 # define JO_SH2_CACHE_PURGE_AREA    (0x40000000)
 /** @brief Cache: line size */
 # define JO_SH2_CACHE_LINE_SIZE     (16)
+/** @brief Cache: size (bytes) */
+# define JO_SH2_CACHE_SIZE          (4096)
 
 /*
 ███████╗ ██████╗███████╗██████╗

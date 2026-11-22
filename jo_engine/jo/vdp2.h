@@ -68,7 +68,8 @@ void            jo_set_displayed_screens(const jo_scroll_screen scroll_screen_fl
 void            jo_set_default_background_color(const jo_color background_color);
 
 /** @brief Set a color for each line of the back screen (visible where no scroll screen is displayed)
- *  @param colors JO_TV_HEIGHT colors (the first one is the top of the screen)
+ *  @param colors JO_TV_HEIGHT colors (the first one is the top of the screen; the lines after them, on a screen of more
+ *         lines (see jo_core_set_screen_resolution()), take the last one)
  *  @remarks Useful for a sky gradient. The colors are copied: the function can be called every frame.
  *  @remarks jo_set_default_background_color() goes back to a single color
  */
@@ -286,11 +287,24 @@ void    jo_vdp2_clear_bitmap_nbg1(const jo_color color);
  */
 void	jo_vdp2_move_nbg1(const int x, const int y);
 
+/** @brief Scroll NBG1 with a fraction of pixel (fixed point: 8 bits of fraction are used)
+ *  @param x Horizontal scroll (pixels of NBG1)
+ *  @param y Vertical scroll
+ */
+void    jo_vdp2_move_nbg1_fixed(const jo_fixed x, const jo_fixed y);
+
 /** @brief Zoom NBG1 width and height independently
  *  @param width_factor Width zoom factor
  *  @param height_factor Height zoom factor
  */
 void	jo_vdp2_zoom_nbg1f(const float width_factor, const float height_factor);
+
+/** @brief Zoom NBG1 (fixed point: without the float functions of libgcc)
+ *  @param width_factor Coordinate increment (horizontal): JO_FIXED_1 normal, JO_FIXED_1 / 2 twice bigger (8 bits of
+ *  fraction are used)
+ *  @param height_factor Coordinate increment (vertical)
+ */
+void    jo_vdp2_zoom_nbg1_fixed(const jo_fixed width_factor, const jo_fixed height_factor);
 
 /** @brief Zoom NBG1
  *  @param factor Zoom factor
@@ -313,6 +327,19 @@ void	jo_vdp2_move_nbg0(const int x, const int y);
  *  @param height_factor Height zoom factor
  */
 void	jo_vdp2_zoom_nbg0f(const float width_factor, const float height_factor);
+
+/** @brief Zoom NBG0 (fixed point: without the float functions of libgcc)
+ *  @param width_factor Coordinate increment (horizontal): JO_FIXED_1 normal, JO_FIXED_1 / 2 twice bigger (8 bits of
+ *  fraction are used)
+ *  @param height_factor Coordinate increment (vertical)
+ */
+void    jo_vdp2_zoom_nbg0_fixed(const jo_fixed width_factor, const jo_fixed height_factor);
+
+/** @brief Scroll NBG0 with a fraction of pixel (fixed point: 8 bits of fraction are used)
+ *  @param x Horizontal scroll (pixels of NBG0)
+ *  @param y Vertical scroll
+ */
+void    jo_vdp2_move_nbg0_fixed(const jo_fixed x, const jo_fixed y);
 
 /** @brief Zoom NBG0
  *  @param factor Zoom factor
@@ -915,6 +942,14 @@ void    jo_vdp2_disable_mosaic(void);
  *  @remarks jo_vdp2_get_registers()[(0x25F800E2 - 0x25F80000) / 2]: SDCTL (shadow control)
  */
 const unsigned short    *jo_vdp2_get_registers(void);
+
+/** @brief Give the VDP2 back to the engine after the game wrote its registers and its VRAM by itself (a video in full
+ *  screen): the registers again as the engine set them (at the next VBLANK), the VRAM cleared,
+ *  the font of jo_printf() and the back screen color drawn again
+ *  @remarks The backgrounds of the game are lost (their places in the VRAM stay reserved): the game sets them again. The
+ *  color RAM is not changed
+ */
+void                    jo_vdp2_restore(void);
 
 #endif /* !__JO_VDP2_H__ */
 

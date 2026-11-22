@@ -62,7 +62,7 @@
 
 /** @brief Textures of the models kept in the program (the next ones: in a bigger table allocated, see
  *  jo_3d_model_add_texture()): a quarter of the sprites, most of them are not textures of models (the textures of the
- *  program, the smaller copies, the tiles), 282 of 1600 in the rally demo */
+ *  program, the smaller copies, the tiles), 282 of 1600 in a 3D game */
 #ifndef JO_3D_MODEL_KEPT_TEXTURES
 # define JO_3D_MODEL_KEPT_TEXTURES              (JO_3D_MODEL_MAX_TEXTURES / 4 < 32 ? 32 : JO_3D_MODEL_MAX_TEXTURES / 4)
 #endif
@@ -81,9 +81,11 @@ static short                                *__jo_3d_model_texture_ids = __jo_3d
 static int                                  __jo_3d_model_texture_capacity = JO_3D_MODEL_KEPT_TEXTURES;
 static int                                  __jo_3d_model_texture_count = 0;
 
+JO_LOW_WORK_RAM_CODE
 static jo_3d_model                          *jo_3d_create_model(const unsigned char * const data, const unsigned int size, void * const file,
                                                                 unsigned char * const storage);
 static void                                 jo_3d_model_free(jo_3d_model * const model, const bool free_file);
+static void                                 jo_3d_model_update_morph_draw(const jo_3d_model * const model);
 
 /** @brief Compare 4 bytes with a chunk tag */
 static  __jo_force_inline bool              jo_3d_model_is_tag(const unsigned char * const p, const char * const tag)
@@ -120,6 +122,11 @@ static bool                                 jo_3d_model_count_fits(const unsigne
         element = sizeof(jo_3d_bone);
     else if (jo_3d_model_is_tag(p, "ANIM"))
         element = sizeof(jo_3d_animation);
+    else if (jo_3d_model_is_tag(p, "SKIN"))
+        element = sizeof(jo_3d_skin_point);
+    else if (jo_3d_model_is_tag(p, "MRPH"))
+        // (the count, the shift and the flags, then the headers)
+        return (chunk >= 8 && count <= (chunk - 8) / sizeof(jo_3d_morph));
     else
         return (true);
     return (chunk >= 4 && count <= (chunk - 4) / element);
@@ -148,6 +155,32 @@ static bool                                 jo_3d_model_animations_fit(const jo_
 #endif
             return (false);
         }
+    }
+    return (true);
+}
+
+/** @brief The frames of the vertex animations of a model are in their chunk, at least 1 frame and a time between 2 frames
+ *  @param model Model (its points, its polygons and its vertex animations loaded)
+ *  @param size Size of the chunk of the vertex animations (from its count)
+ *  @return false if a vertex animation is wrong
+ *  @remarks Optional: a chunk "MRPH" of another layout (the own data of a game, read with jo_3d_model_find_chunk()) is
+ *           ignored, without error
+ */
+JO_LOW_WORK_RAM_CODE
+static bool                                 jo_3d_model_morphs_fit(const jo_3d_model * const model, const unsigned int size)
+{
+    const jo_3d_morph                       *m;
+    register unsigned int                   i;
+
+    // (a value of a frame x 2^shift: at most 2^16 (a s16 x 2^16 is 2^31: a whole 16.16 fixed))
+    if (model->morph_shift > 16 || model->morph_frame_size == 0)
+        return (false);
+    for (JO_ZERO(i); i < model->morph_count; ++i)
+    {
+        m = &model->morphs[i];
+        if (m->frame_count == 0 || m->frame_ticks == 0 || (m->offset & 3) || m->offset > size ||
+            m->frame_count > (size - m->offset) / model->morph_frame_size)
+            return (false);
     }
     return (true);
 }
@@ -211,6 +244,16 @@ static void                                 jo_3d_model_mark_duplicates(const jo
                 break;
             }
     }
+    for (JO_ZERO(k); k < model->morph_count; ++k)
+    {
+        model->morphs[k].duplicate = 0;
+        for (JO_ZERO(j); j < k; ++j)
+            if (jo_3d_model_same_name(model->morphs[j].name, model->morphs[k].name))
+            {
+                model->morphs[k].duplicate = 1;
+                break;
+            }
+    }
 }
 
 /** @brief The 2 hashes of a texture name (case insensitive, its first 15 characters: the length of the names kept before,
@@ -256,6 +299,7 @@ static int                                  jo_3d_model_find_texture(const char 
  *  @param capacity JO_3D_MODEL_KEPT_TEXTURES: the tables kept in the program, more: a table allocated
  *  @return false if out of memory (the tables used stay)
  */
+JO_LOW_WORK_RAM_CODE
 static bool                                 jo_3d_model_texture_tables(const int capacity)
 {
     jo_3d_model_texture_name                *names;
@@ -284,6 +328,7 @@ static bool                                 jo_3d_model_texture_tables(const int
 }
 
 /** @brief Keep the name of a texture of the models (it is loaded once) */
+JO_LOW_WORK_RAM_CODE
 static void                                 jo_3d_model_add_texture(const char * const name, const int id)
 {
     if (id < 0 || __jo_3d_model_texture_count >= JO_3D_MODEL_MAX_TEXTURES)
@@ -297,6 +342,7 @@ static void                                 jo_3d_model_add_texture(const char *
     __jo_3d_model_texture_ids[__jo_3d_model_texture_count++] = (short)id;
 }
 
+JO_LOW_WORK_RAM_CODE
 void                                        jo_3d_model_free_textures_from(const int sprite_id)
 {
     register int                            i;
@@ -436,6 +482,7 @@ static bool                                 jo_3d_model_read_textures(jo_file * 
     return (true);
 }
 
+JO_LOW_WORK_RAM_CODE
 jo_3d_model                                 *jo_3d_load_model(const char * const filename)
 {
     jo_file                                 file;
@@ -488,9 +535,35 @@ jo_3d_model                                 *jo_3d_load_model(const char * const
 
 /** @brief A gouraud table per polygon (the cells, lit by the point lights, see __jo_3d_load_model_for_lights()) */
 static bool                                 __jo_3d_model_unique_gouraud_tables = false;
-/** @brief The polygons whose gouraud table leaves the texels as they are: drawn without gouraud (see
- *  jo_3d_set_neutral_gouraud_skipped()) */
-static bool                                 __jo_3d_model_skip_neutral_gouraud = false;
+/** @brief The polygons drawn without gouraud: 1 those whose gouraud table leaves the texels as they are (see
+ *  jo_3d_set_neutral_gouraud_skipped()), 2 those whose 4 colors are the same too (see jo_3d_set_uniform_gouraud_skipped(),
+ *  the default) */
+static unsigned char                        __jo_3d_model_skip_gouraud = 2;
+/** @brief The copies of the color lookup tables with a light (see jo_3d_set_uniform_gouraud_skipped()): the table, the
+ *  light (a gouraud color), the copy (VRAM / 8, 0: free entry) */
+#define JO_3D_MODEL_LIT_LUTS                (256)
+/** @brief The hash of the copies: 2 x JO_3D_MODEL_LIT_LUTS entries (bits of the index) */
+#define JO_3D_MODEL_LIT_HASH_BITS           (9)
+typedef struct
+{
+    unsigned short                          lut;
+    unsigned short                          light;
+    unsigned short                          copy;
+}                                           jo_3d_model_lit_lut;
+/** @brief The copies, a hash of them (entry + 1, 0: free), the copies to make for a model (2.5 KB): forgotten by
+ *  jo_3d_set_uniform_gouraud_skipped(), when sprites are freed (their copies may be among them) and when half of them are
+ *  used at the start of a model (the next ones make their copies again) */
+typedef struct
+{
+    jo_3d_model_lit_lut                     entries[JO_3D_MODEL_LIT_LUTS];
+    unsigned short                          hash[JO_3D_MODEL_LIT_LUTS * 2];
+    unsigned short                          pending[JO_3D_MODEL_LIT_LUTS];
+}                                           jo_3d_model_lit_lut_set;
+static jo_3d_model_lit_lut_set              __jo_3d_model_lit_set;
+static unsigned int                         __jo_3d_model_lit_lut_count = 0;
+#define __jo_3d_model_lit_luts              (__jo_3d_model_lit_set.entries)
+#define __jo_3d_model_lit_lut_hash          (__jo_3d_model_lit_set.hash)
+#define __jo_3d_model_lit_pending           (__jo_3d_model_lit_set.pending)
 /** @brief A gouraud color that leaves the texel as it is (16, 16, 16) */
 #define JO_3D_MODEL_NEUTRAL_GOURAUD         (0xC210)
 
@@ -498,6 +571,185 @@ static bool                                 __jo_3d_model_skip_neutral_gouraud =
 static  __jo_force_inline unsigned int      jo_3d_model_gouraud_hash(const unsigned short * const t)
 {
     return ((((unsigned int)t[0] * 31u + t[1]) * 31u + t[2]) * 31u + t[3]) * 0x9E3779B1u;
+}
+
+/** @brief A component of a color + a gouraud one: what the VDP1 draws (saturated between 0 and 31, as Mednafen)
+ *  @param sum The component + the gouraud one
+ *  @return The component
+ */
+static  __jo_force_inline unsigned int      jo_3d_model_lit_component(const int sum)
+{
+    return ((unsigned int)JO_MIN(31, JO_MAX(0, sum - 16)));
+}
+
+/** @brief An RGB color with a gouraud color: what the VDP1 draws (each component + the gouraud one - 16, between 0 and 31)
+ *  @param color RGB color (a palette color, without its MSB: as it is, the VDP1 does not shade it)
+ *  @param light Gouraud color
+ *  @return The color
+ */
+static  __jo_force_inline unsigned short    jo_3d_model_lit_color(const unsigned short color, const unsigned short light)
+{
+    if (!(color & JO_COLOR_SATURN_MSB))
+        return (color);
+    return ((unsigned short)(JO_COLOR_SATURN_MSB |
+                             (jo_3d_model_lit_component((int)JO_COLOR_SATURN_GET_B(color) + (int)JO_COLOR_SATURN_GET_B(light)) << 10) |
+                             (jo_3d_model_lit_component((int)JO_COLOR_SATURN_GET_G(color) + (int)JO_COLOR_SATURN_GET_G(light)) << 5) |
+                             jo_3d_model_lit_component((int)JO_COLOR_SATURN_GET_R(color) + (int)JO_COLOR_SATURN_GET_R(light))));
+}
+
+/** @brief The copy of a color lookup table with a light (see jo_3d_set_uniform_gouraud_skipped())
+ *  @param lut Color lookup table (VRAM / 8)
+ *  @param light Gouraud color
+ *  @return Its entry (copy: 0 if not made yet), JO_NULL if the list is full
+ */
+JO_LOW_WORK_RAM_CODE
+static jo_3d_model_lit_lut                  *jo_3d_model_find_lit_lut(const unsigned short lut, const unsigned short light)
+{
+    jo_3d_model_lit_lut                     *entry;
+    unsigned int                            slot;
+
+    // (a hash of the entries + 1, 0: free; thousands of polygons in a track, the list in one loop took 0.4 s)
+    if (__jo_3d_model_lit_lut_count == 0)
+        jo_memset(__jo_3d_model_lit_lut_hash, 0, sizeof(__jo_3d_model_lit_lut_hash));
+    for (slot = ((unsigned int)lut * 31u + light) * 0x9E3779B1u >> (32 - JO_3D_MODEL_LIT_HASH_BITS);;
+         slot = (slot + 1) & (JO_3D_MODEL_LIT_LUTS * 2 - 1))
+    {
+        if (__jo_3d_model_lit_lut_hash[slot] == 0)
+            break;
+        entry = &__jo_3d_model_lit_luts[__jo_3d_model_lit_lut_hash[slot] - 1];
+        if (entry->lut == lut && entry->light == light)
+            return (entry);
+    }
+    if (__jo_3d_model_lit_lut_count >= JO_3D_MODEL_LIT_LUTS)
+        return (JO_NULL);
+    entry = &__jo_3d_model_lit_luts[__jo_3d_model_lit_lut_count++];
+    __jo_3d_model_lit_lut_hash[slot] = (unsigned short)__jo_3d_model_lit_lut_count;
+    entry->lut = lut;
+    entry->light = light;
+    entry->copy = 0;
+    return (entry);
+}
+
+/** @brief The polygons whose 4 gouraud colors are the same: without gouraud, the light in their color (see
+ *  jo_3d_set_uniform_gouraud_skipped())
+ *  @param model Model (gouraud_table of an attribute: the index of the polygon + 1 when it uses its table)
+ *  @param gouraud The table of each polygon (4 colors)
+ *  @param pending The copies of color lookup tables to make for this model (output: indexes in __jo_3d_model_lit_luts)
+ *  @param pending_count Their count (output)
+ *  @remarks The polygons of a texture whose copy is to make keep their color lookup table and their gouraud flag, without
+ *           table (0), until the copy is made: see jo_3d_model_set_lit_luts(). Not a mark in their color: a table in the
+ *           upper half of the VRAM (address / 8 >= 0x8000) looked like one, it got the copy of another texture
+ */
+JO_LOW_WORK_RAM_CODE
+static void                                 jo_3d_model_skip_uniform_gouraud(jo_3d_model * const model, const unsigned short * const gouraud,
+                                                                             unsigned short * const pending, unsigned int * const pending_count)
+{
+    jo_3d_polygon_attribute                 *a;
+    jo_3d_model_lit_lut                     *entry;
+    const unsigned short                    *t;
+    unsigned int                            n;
+    unsigned int                            k;
+    unsigned int                            i;
+    unsigned int                            j;
+    unsigned short                          light;
+
+    n = model->mesh->data.polygon_count;
+    for (JO_ZERO(k); k < n; ++k)
+    {
+        a = &model->mesh->data.attributes[k];
+        t = &gouraud[k * 4];
+        if (a->gouraud_table == 0 || t[0] != t[1] || t[0] != t[2] || t[0] != t[3] || (a->sort & JO_3D_USE_LIGHT))
+            continue;
+        light = (unsigned short)(t[0] | JO_COLOR_SATURN_MSB);
+        if (light == JO_3D_MODEL_NEUTRAL_GOURAUD)
+            ;
+        else if (!(a->sort & JO_3D_USE_TEXTURE))
+        {
+            // (a palette color: the VDP1 does not shade it, as it is)
+            a->color = jo_3d_model_lit_color(a->color, light);
+        }
+        else if ((a->draw_mode & JO_VDP1_COLOR_MODE_MASK) == JO_VDP1_COLOR_MODE_16_LOOKUP && a->color != 0 &&
+                 (entry = jo_3d_model_find_lit_lut(a->color, light)) != JO_NULL)
+        {
+            if (entry->copy != 0)
+                a->color = entry->copy;
+            else
+            {
+                // (a copy to make: once per model; the polygon waits for it, gouraud flag kept, no table)
+                i = (unsigned int)(entry - __jo_3d_model_lit_luts);
+                for (JO_ZERO(j); j < *pending_count && pending[j] != i; ++j)
+                    ;
+                if (j >= *pending_count)
+                    pending[(*pending_count)++] = (unsigned short)i;
+                a->gouraud_table = 0;
+                continue;
+            }
+        }
+        else
+            continue;
+        a->gouraud_table = 0;
+        a->draw_mode &= ~JO_VDP1_COLOR_CALC_GOURAUD;
+    }
+}
+
+/** @brief The copies of the color lookup tables with their light (see jo_3d_model_skip_uniform_gouraud())
+ *  @param compact Where to write them (16 colors each: the VRAM)
+ *  @param pending Their entries
+ *  @param count Their count
+ */
+JO_LOW_WORK_RAM_CODE
+static void                                 jo_3d_model_write_lit_luts(volatile unsigned short * const compact, const unsigned short * const pending,
+                                                                       const unsigned int count)
+{
+    const volatile unsigned short           *src;
+    const jo_3d_model_lit_lut               *entry;
+    unsigned int                            k;
+    unsigned int                            i;
+
+    for (JO_ZERO(k); k < count; ++k)
+    {
+        entry = &__jo_3d_model_lit_luts[pending[k]];
+        src = (const volatile unsigned short *)(JO_VDP1_VRAM + JO_MULT_BY_8(entry->lut));
+        for (JO_ZERO(i); i < 16; ++i)
+            compact[k * 16 + i] = jo_3d_model_lit_color(src[i], entry->light);
+    }
+}
+
+/** @brief The polygons that wait for a copy of their color lookup table (gouraud flag without table, see
+ *  jo_3d_model_skip_uniform_gouraud()): the copy, or their table without the light (base 0: out of VRAM)
+ *  @param model Model
+ *  @param gouraud The table of each polygon (4 colors): the light of a polygon, to find its copy
+ *  @param pending The entries of the copies made
+ *  @param count Their count
+ *  @param base The first copy (VRAM / 8, a multiple of 4, the next ones 4 tables after), 0: not made
+ */
+JO_LOW_WORK_RAM_CODE
+static void                                 jo_3d_model_set_lit_luts(jo_3d_model * const model, const unsigned short * const gouraud,
+                                                                     const unsigned short * const pending, const unsigned int count,
+                                                                     const unsigned short base)
+{
+    jo_3d_polygon_attribute                 *a;
+    jo_3d_model_lit_lut                     *entry;
+    unsigned int                            k;
+    unsigned int                            i;
+
+    for (JO_ZERO(i); i < count; ++i)
+        __jo_3d_model_lit_luts[pending[i]].copy = base != 0 ? (unsigned short)(base + i * 4) : 0;
+    for (JO_ZERO(k); k < model->mesh->data.polygon_count; ++k)
+    {
+        a = &model->mesh->data.attributes[k];
+        if (a->gouraud_table != 0 || !(a->draw_mode & JO_VDP1_COLOR_CALC_GOURAUD))
+            continue;
+        // (no copy: the table of the texture, without the light; the entry forgotten for the next models)
+        if (base != 0 && (a->sort & JO_3D_USE_TEXTURE) &&
+            (a->draw_mode & JO_VDP1_COLOR_MODE_MASK) == JO_VDP1_COLOR_MODE_16_LOOKUP &&
+            (entry = jo_3d_model_find_lit_lut(a->color, (unsigned short)(gouraud[k * 4] | JO_COLOR_SATURN_MSB))) != JO_NULL &&
+            entry->copy != 0)
+            a->color = entry->copy;
+        a->draw_mode &= ~JO_VDP1_COLOR_CALC_GOURAUD;
+    }
+    if (base == 0)
+        __jo_3d_model_lit_lut_count = 0;
 }
 
 /** @brief The gouraud tables of the polygons of a model in the VRAM: the polygons with the same 4 colors share one table
@@ -513,6 +765,7 @@ static  __jo_force_inline unsigned int      jo_3d_model_gouraud_hash(const unsig
 static unsigned short                       __jo_3d_model_gouraud_hash[JO_3D_MODEL_GOURAUD_HASH];
 static unsigned short                       __jo_3d_model_gouraud_compact[JO_3D_MODEL_GOURAUD_COMPACT * 4];
 
+JO_LOW_WORK_RAM_CODE
 static void                                 jo_3d_model_add_gouraud_tables(jo_3d_model * const model, const unsigned short * const gouraud)
 {
     jo_3d_polygon_attribute                 *attributes;
@@ -526,13 +779,21 @@ static void                                 jo_3d_model_add_gouraud_tables(jo_3d
     unsigned int                            count;
     unsigned int                            first;
     unsigned int                            k;
+    unsigned int                            luts;
+    unsigned int                            reserved;
     unsigned short                          base;
 
     attributes = model->mesh->data.attributes;
     n = model->mesh->data.polygon_count;
+    JO_ZERO(luts);
     // (the polygons whose 4 colors leave the texels as they are: without gouraud, the same picture; Mednafen emulates a
     // pixel of gouraud slower: the gouraud of all the polygons of a split screen cost 6 % of its time)
-    if (__jo_3d_model_skip_neutral_gouraud && !__jo_3d_model_unique_gouraud_tables)
+    // (half of the copies of the color lookup tables known: forgotten, room for those of this model)
+    if (__jo_3d_model_lit_lut_count >= JO_3D_MODEL_LIT_LUTS / 2)
+        __jo_3d_model_lit_lut_count = 0;
+    if (__jo_3d_model_skip_gouraud == 2 && !__jo_3d_model_unique_gouraud_tables)
+        jo_3d_model_skip_uniform_gouraud(model, gouraud, __jo_3d_model_lit_pending, &luts);
+    else if (__jo_3d_model_skip_gouraud && !__jo_3d_model_unique_gouraud_tables)
         for (JO_ZERO(k); k < n; ++k)
             if (attributes[k].gouraud_table != 0 &&
                 (gouraud[k * 4] | 0x8000) == JO_3D_MODEL_NEUTRAL_GOURAUD &&
@@ -546,7 +807,7 @@ static void                                 jo_3d_model_add_gouraud_tables(jo_3d
     for (JO_ZERO(k), JO_ZERO(used); k < n; ++k)
         if (attributes[k].gouraud_table != 0)
             ++used;
-    if (used == 0)
+    if (used == 0 && luts == 0)
         return;
     hash = JO_NULL;
     if (!__jo_3d_model_unique_gouraud_tables && n < 0xFFFF)
@@ -559,6 +820,11 @@ static void                                 jo_3d_model_add_gouraud_tables(jo_3d
     }
     if (hash == JO_NULL)
     {
+        // (the copies of the color lookup tables not made: the tables of the textures, without the light)
+        if (luts != 0)
+            jo_3d_model_set_lit_luts(model, gouraud, __jo_3d_model_lit_pending, luts, 0);
+        if (used == 0)
+            return;
         // A table per polygon (the tables of a room lit by the point lights, see __jo_3d_load_model_for_lights())
         base = jo_3d_add_gouraud_tables((const jo_color *)gouraud, n);
         model->gouraud_tables = base;
@@ -595,10 +861,15 @@ static void                                 jo_3d_model_add_gouraud_tables(jo_3d
     }
     if (hash != __jo_3d_model_gouraud_hash)
         jo_free(hash);
-    compact = ((count + 1) & ~1u) <= JO_3D_MODEL_GOURAUD_COMPACT ? __jo_3d_model_gouraud_compact :
-              (unsigned short *)jo_malloc(((count + 1) & ~1u) * 4 * sizeof(unsigned short));
+    // (the copies of the color lookup tables first: 4 tables each, at an address multiple of 32 bytes (the VDP1 reads a
+    // table there: the 2 low bits of the color ignored), then the gouraud tables)
+    reserved = luts != 0 ? luts * 4 + 4 : 0;
+    compact = ((reserved + count + 1) & ~1u) <= JO_3D_MODEL_GOURAUD_COMPACT ? __jo_3d_model_gouraud_compact :
+              (unsigned short *)jo_malloc(((reserved + count + 1) & ~1u) * 4 * sizeof(unsigned short));
     if (compact == JO_NULL)
     {
+        if (luts != 0)
+            jo_3d_model_set_lit_luts(model, gouraud, __jo_3d_model_lit_pending, luts, 0);
         // (the first polygon of each table: its own table)
         base = jo_3d_add_gouraud_tables((const jo_color *)gouraud, n);
         model->gouraud_tables = base;
@@ -611,9 +882,10 @@ static void                                 jo_3d_model_add_gouraud_tables(jo_3d
                 attributes[k].draw_mode &= ~JO_VDP1_COLOR_CALC_GOURAUD;
         return;
     }
+    jo_memset(compact, 0, reserved * 4 * sizeof(unsigned short));
     // The different tables in the order of their first polygon: the index of the table of a polygon (the polygons before
     // it already have theirs, its first polygon too)
-    for (JO_ZERO(k), JO_ZERO(count); k < n; ++k)
+    for (JO_ZERO(k), count = reserved; k < n; ++k)
     {
         if (attributes[k].gouraud_table == 0)
             continue;
@@ -632,6 +904,14 @@ static void                                 jo_3d_model_add_gouraud_tables(jo_3d
     base = jo_3d_add_gouraud_tables((const jo_color *)compact, count);
     if (compact != __jo_3d_model_gouraud_compact)
         jo_free(compact);
+    if (base != 0 && luts != 0)
+    {
+        first = (base + 3u) & ~3u;
+        jo_3d_model_write_lit_luts((unsigned short *)(JO_VDP1_VRAM + JO_MULT_BY_8(first)), __jo_3d_model_lit_pending, luts);
+        jo_3d_model_set_lit_luts(model, gouraud, __jo_3d_model_lit_pending, luts, (unsigned short)first);
+    }
+    else if (luts != 0)
+        jo_3d_model_set_lit_luts(model, gouraud, __jo_3d_model_lit_pending, luts, 0);
     model->gouraud_tables = base;
     model->gouraud_table_count = base != 0 ? (unsigned short)count : 0;
     for (JO_ZERO(k); k < n; ++k)
@@ -653,13 +933,27 @@ void                                        jo_3d_set_unique_gouraud_tables(cons
     __jo_3d_model_unique_gouraud_tables = unique;
 }
 
+void                                        __jo_3d_model_forget_lit_luts(void)
+{
+    // (the copies stay with the models that made them: not shared with the next ones)
+    __jo_3d_model_lit_lut_count = 0;
+}
+
 void                                        jo_3d_set_neutral_gouraud_skipped(const bool skipped)
 {
-    __jo_3d_model_skip_neutral_gouraud = skipped;
+    __jo_3d_model_forget_lit_luts();
+    __jo_3d_model_skip_gouraud = skipped ? 1 : 0;
+}
+
+void                                        jo_3d_set_uniform_gouraud_skipped(const bool skipped)
+{
+    __jo_3d_model_forget_lit_luts();
+    __jo_3d_model_skip_gouraud = skipped ? 2 : 0;
 }
 
 #ifdef JO_COMPILE_WITH_FS_SUPPORT
 
+JO_LOW_WORK_RAM_CODE
 jo_3d_model                                 *__jo_3d_load_model_for_lights(const char * const filename)
 {
     jo_3d_model                             *model;
@@ -670,9 +964,24 @@ jo_3d_model                                 *__jo_3d_load_model_for_lights(const
     return (model);
 }
 
+JO_LOW_WORK_RAM_CODE
+jo_3d_model                                 *__jo_3d_load_model_for_tint(const char * const filename)
+{
+    jo_3d_model                             *model;
+    unsigned char                           skip;
+
+    // (all the polygons keep their gouraud table: the tint is a copy of the tables, see jo_3d_set_tint())
+    skip = __jo_3d_model_skip_gouraud;
+    __jo_3d_model_skip_gouraud = 0;
+    model = jo_3d_load_model(filename);
+    __jo_3d_model_skip_gouraud = skip;
+    return (model);
+}
+
 #endif /* JO_COMPILE_WITH_FS_SUPPORT */
 
 /** @brief Set the attributes of the polygons from their materials */
+JO_LOW_WORK_RAM_CODE
 static void                                 jo_3d_model_set_attributes(jo_3d_model * const model, const unsigned short * const gouraud)
 {
     register unsigned int                   k;
@@ -708,6 +1017,8 @@ static void                                 jo_3d_model_set_attributes(jo_3d_mod
             jo_3d_set_mesh_polygon_transparency(mesh, true, k);
         if (m->flags & JO_3D_MATERIAL_SCREEN_DOORS)
             jo_3d_set_mesh_polygon_screen_doors(mesh, true, k);
+        if (texture >= 0 && (m->flags & JO_3D_MATERIAL_HIGH_SPEED_SHRINK))
+            a->draw_mode |= JO_VDP1_HIGH_SPEED_SHRINK;
         if (texture >= 0 && (m->flags & JO_3D_MATERIAL_FLIP_H))
             a->direction |= JO_VDP1_H_FLIP;
         if (texture >= 0 && (m->flags & JO_3D_MATERIAL_FLIP_V))
@@ -724,6 +1035,7 @@ static void                                 jo_3d_model_set_attributes(jo_3d_mod
 }
 
 /** @brief Apply the texture options of the materials (once per texture) */
+JO_LOW_WORK_RAM_CODE
 static void                                 jo_3d_model_set_texture_options(const jo_3d_model * const model)
 {
     register unsigned int                   k;
@@ -1004,6 +1316,72 @@ static void                                 jo_3d_model_pose_bone(const jo_3d_mo
         jo_3d_model_pose_bone(model, child, pose, callback, param, m, (const jo_fixed (*)[3])matrix);
 }
 
+/** @brief The matrices of a bone and of its children in the space of the model (without the camera and the root offset
+ *  of the pose: the bones of a skin, see jo_3d_model_skin())
+ *  @param out The matrices of all the bones
+ */
+static void                                 jo_3d_model_bone_space(const jo_3d_model * const model, const int bone,
+                                                                   const jo_3d_pose * const pose, jo_3d_matrix_rows * const out,
+                                                                   const jo_fixed (* const parent)[3])
+{
+    static const jo_angle                   no_angles[3] = {0, 0, 0};
+    int                                     child;
+
+    __jo_3d_bone_matrix(out[bone], parent, &model->bones[bone].pivot, pose != JO_NULL ? pose->angles[bone] : no_angles);
+    for (child = model->bone_children[bone]; child >= 0; child = model->bone_children[model->bone_count + child])
+        jo_3d_model_bone_space(model, child, pose, out, (const jo_fixed (*)[3])out[bone]);
+}
+
+/** @brief The points of the skin of a pose (see jo_3d_skin_point) in the buffer of the model for this CPU: a point drawn
+ *  by the matrix of its bone, moved toward where the other bone puts it: p + weight x (B^-1 x O x p - p), B and O the
+ *  matrices of the 2 bones in the space of the model (rotations and translations: B^-1 is its transpose)
+ *  @return The polygon data to draw (the buffer, or the mesh of the model without a buffer)
+ */
+static const jo_3d_polygon_data            *jo_3d_model_skin(const jo_3d_model * const model, const jo_3d_pose * const pose,
+                                                              jo_3d_polygon_data * const d)
+{
+    static const jo_fixed                   identity[4][3] = {{JO_FIXED_1, 0, 0}, {0, JO_FIXED_1, 0}, {0, 0, JO_FIXED_1}, {0, 0, 0}};
+    jo_3d_matrix_rows                       *bones;
+    const jo_3d_skin_point                  *s;
+    const jo_pos3D_fixed                    *p;
+    jo_pos3D_fixed                          *out;
+    jo_pos3D_fixed                          q;
+    jo_fixed                                weight;
+    jo_fixed                                (*b)[3];
+    register unsigned int                   k;
+
+    if (model->skin_count == 0 || d == JO_NULL)
+        return (&model->mesh->data);
+    // (the matrices at the end of the block of this CPU, see jo_3d_model_create_morph_draw())
+    bones = (jo_3d_matrix_rows *)((unsigned char *)d + ((sizeof(jo_3d_polygon_data) + 3) & ~3u) +
+                                  d->point_count * sizeof(jo_pos3D_fixed) +
+                                  (d->polygons != model->mesh->data.polygons ? d->polygon_count * sizeof(jo_3d_polygon) : 0));
+    for (JO_ZERO(k); k < model->bone_count; ++k)
+        if (model->bones[k].parent < 0)
+            jo_3d_model_bone_space(model, (int)k, pose, bones, identity);
+    // (the other points: the ones of the model (a vertex animation of the same model wrote over them))
+    if (model->morph_count > 0)
+        jo_memcpy(d->points, model->mesh->data.points, d->point_count * sizeof(jo_pos3D_fixed));
+    for (JO_ZERO(k); k < model->skin_count; ++k)
+    {
+        s = &model->skin[k];
+        p = &model->mesh->data.points[s->point];
+        out = &d->points[s->point];
+        // Where the other bone puts the point (in the space of the model), back in the space of its own bone
+        jo_3d_transform_point_by((const jo_fixed (*)[3])bones[s->other], p, &q);
+        b = bones[s->bone];
+        q.x -= b[3][0];
+        q.y -= b[3][1];
+        q.z -= b[3][2];
+        // (JO_3D_SKIN_ONE is 1.0 / 2 in 16.16)
+        weight = s->weight * (JO_FIXED_1 / JO_3D_SKIN_ONE);
+        out->x = p->x + jo_fixed_mult(jo_fixed_dot((const jo_fixed *)&q, b[0]) - p->x, weight);
+        out->y = p->y + jo_fixed_mult(jo_fixed_dot((const jo_fixed *)&q, b[1]) - p->y, weight);
+        out->z = p->z + jo_fixed_mult(jo_fixed_dot((const jo_fixed *)&q, b[2]) - p->z, weight);
+    }
+    return (d);
+}
+
 #ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
 /** @brief The matrices of the bones of the pose drawn by the slave CPU (not on its stack: it is small) */
 static jo_3d_model_pose_matrices            __jo_3d_slave_pose_matrices;
@@ -1020,6 +1398,13 @@ void                                        jo_3d_slave_model_draw_pose(const jo
     unsigned int                            hidden;
 #endif
 
+#ifdef JO_DEBUG
+    if (model == JO_NULL)
+    {
+        jo_core_error("model is null");
+        return;
+    }
+#endif
 #ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
     // (the bones hidden: in the matrices of the slave CPU, the mask of the master CPU is not changed while it draws)
     m = &__jo_3d_slave_pose_matrices;
@@ -1035,7 +1420,7 @@ void                                        jo_3d_slave_model_draw_pose(const jo
         jo_3d_slave_pop_matrix();
     }
     if (m->part_count > 0)
-        __jo_3d_slave_draw_parts(&model->mesh->data, m->parts, m->part_count);
+        __jo_3d_slave_draw_parts(jo_3d_model_skin(model, pose, model->morph_draw[1]), m->parts, m->part_count);
 #else
     // (without the dual CPU module: drawn by the master CPU, like a job of jo_core_exec_on_slave())
     hidden = __jo_3d_hidden_bones;
@@ -1051,6 +1436,13 @@ void                                        jo_3d_model_draw_pose(const jo_3d_mo
     jo_3d_model_pose_matrices               m;
     register unsigned int                   k;
 
+#ifdef JO_DEBUG
+    if (model == JO_NULL)
+    {
+        jo_core_error("model is null");
+        return;
+    }
+#endif
     // The matrices of the bones, then one draw: the points of each bone are transformed by its matrix (a draw per bone
     // would cost about 0.1 ms each)
     m.part_count = 0;
@@ -1065,7 +1457,7 @@ void                                        jo_3d_model_draw_pose(const jo_3d_mo
     }
     jo_3d_pop_matrix();
     if (m.part_count > 0)
-        __jo_3d_draw_parts(&model->mesh->data, m.parts, m.part_count);
+        __jo_3d_draw_parts(jo_3d_model_skin(model, pose, model->morph_draw[0]), m.parts, m.part_count);
 }
 
 /** @brief An address in the high work RAM (cached or not) */
@@ -1129,6 +1521,7 @@ bool                                        jo_3d_model_use_fast_memory(jo_3d_mo
     jo_memcpy(attributes, pdata->attributes, pdata->polygon_count * sizeof(jo_3d_polygon_attribute));
     jo_free(pdata->attributes);
     pdata->attributes = attributes;
+    jo_3d_model_update_morph_draw(model);
     model->fast_block = block;
     return (true);
 }
@@ -1143,6 +1536,240 @@ bool                                        jo_3d_model_use_fast_memory(jo_3d_mo
 #define JO_3D_MODEL_BLOCK_ATTRIBUTES        (JO_3D_MODEL_BLOCK_MESH + ((sizeof(jo_3d_mesh) + 3) & ~3u))
 #define JO_3D_MODEL_BLOCK_TEXTURES(polygons) (JO_3D_MODEL_BLOCK_ATTRIBUTES + (((polygons) * sizeof(jo_3d_polygon_attribute) + 3) & ~3u))
 
+/*
+** Vertex animations (morph targets)
+*/
+
+/** @brief jo_3d_morph_normal(): the golden angle (360 x (1 - 1 / golden ratio) degrees) in jo_angle */
+#define JO_3D_MORPH_GOLDEN_ANGLE                (25033)
+
+void                                        jo_3d_morph_normal(const int index, jo_pos3D_fixed * const normal)
+{
+    jo_fixed                                y;
+    jo_fixed                                r;
+    jo_fixed                                s;
+    jo_fixed                                c;
+    int                                     i;
+
+    // The directions: a golden angle spiral on the sphere, y from 1 to -1 (Compiler/COMMON/jo_model.py
+    // morph_normal_table(): the same directions), computed (a table cost 768 bytes)
+    i = index & (JO_3D_MORPH_NORMALS - 1);
+    y = JO_FIXED_1 - (2 * i + 1) * (JO_FIXED_1 / JO_3D_MORPH_NORMALS);
+    r = jo_fixed_sqrt(JO_FIXED_1 - jo_fixed_mult(y, y));
+    jo_sincos_angle((jo_angle)(i * JO_3D_MORPH_GOLDEN_ANGLE), &s, &c);
+    normal->x = jo_fixed_mult(c, r);
+    normal->y = y;
+    normal->z = jo_fixed_mult(s, r);
+}
+
+/** @brief The polygons of a model are lit (jo_light: the normals of the frames are used) */
+static bool                                 jo_3d_model_has_lit_polygons(const jo_3d_model * const model)
+{
+    register unsigned int                   k;
+
+    for (JO_ZERO(k); k < model->mesh->data.polygon_count; ++k)
+        if (model->mesh->data.attributes[k].sort & JO_3D_USE_LIGHT)
+            return (true);
+    return (false);
+}
+
+/** @brief The polygon data drawn by jo_3d_model_draw_morph() point to the polygons and the attributes of the model (after
+ *  they moved, see jo_3d_model_use_fast_memory()) */
+JO_LOW_WORK_RAM_CODE
+static void                                 jo_3d_model_update_morph_draw(const jo_3d_model * const model)
+{
+    jo_3d_polygon_data                      *d;
+    register unsigned int                   k;
+
+    for (JO_ZERO(k); k < 2; ++k)
+    {
+        d = model->morph_draw[k];
+        if (d == JO_NULL)
+            continue;
+        d->attributes = model->mesh->data.attributes;
+        // (the polygons of the model, or their copy with the normals of the frames: its vertices are the same)
+        if (!(model->morph_normals && jo_3d_model_has_lit_polygons(model)))
+            d->polygons = model->mesh->data.polygons;
+    }
+}
+
+/** @brief Bytes of the matrices of the bones of the skin of a model (see jo_3d_model_skin()) */
+static unsigned int                         jo_3d_model_skin_matrices_size(const jo_3d_model * const model)
+{
+    return (model->skin_count > 0 ? model->bone_count * sizeof(jo_3d_matrix_rows) : 0);
+}
+
+/** @brief The polygon data drawn by jo_3d_model_draw_morph() (one block for each CPU: the polygon data, the points, the
+ *  polygons with the normals of the frames if some are lit)
+ *  @return false if out of memory
+ */
+JO_LOW_WORK_RAM_CODE
+static bool                                 jo_3d_model_create_morph_draw(jo_3d_model * const model)
+{
+    const jo_3d_polygon_data                *src;
+    jo_3d_polygon_data                      *d;
+    unsigned char                           *block;
+    unsigned int                            head;
+    unsigned int                            points;
+    unsigned int                            polygons;
+    register unsigned int                   k;
+
+    src = &model->mesh->data;
+    head = (sizeof(jo_3d_polygon_data) + 3) & ~3u;
+    points = src->point_count * sizeof(jo_pos3D_fixed);
+    polygons = model->morph_normals && jo_3d_model_has_lit_polygons(model) ? src->polygon_count * sizeof(jo_3d_polygon) : 0;
+    for (JO_ZERO(k); k < 2; ++k)
+    {
+        // (then the matrices of the bones of a skin: not on the stack, the one of the slave CPU is small)
+        block = (unsigned char *)jo_malloc(head + points + polygons + jo_3d_model_skin_matrices_size(model));
+        if (block == JO_NULL)
+            return (false);
+        d = (jo_3d_polygon_data *)block;
+        *d = *src;
+        d->points = (jo_pos3D_fixed *)(block + head);
+        jo_memcpy(d->points, src->points, points);
+        if (polygons > 0)
+        {
+            d->polygons = (jo_3d_polygon *)(block + head + points);
+            jo_memcpy(d->polygons, src->polygons, polygons);
+        }
+        model->morph_draw[k] = d;
+    }
+    return (true);
+}
+
+/** @brief Free the polygon data of jo_3d_model_draw_morph() (and the copies of their tints) */
+JO_LOW_WORK_RAM_CODE
+static void                                 jo_3d_model_free_morph_draw(jo_3d_model * const model)
+{
+    register unsigned int                   k;
+
+    for (JO_ZERO(k); k < 2; ++k)
+        if (model->morph_draw[k] != JO_NULL)
+        {
+            __jo_3d_forget_tint(model->morph_draw[k]);
+            jo_free(model->morph_draw[k]);
+            model->morph_draw[k] = JO_NULL;
+        }
+}
+
+int                                         jo_3d_model_find_morph(const jo_3d_model * const model, const char * const name)
+{
+    register unsigned int                   k;
+
+    for (JO_ZERO(k); k < model->morph_count; ++k)
+        if (jo_3d_model_same_name(model->morphs[k].name, name))
+            return ((int)k);
+    return (-1);
+}
+
+int                                         jo_3d_model_morph_duration(const jo_3d_model * const model, const int morph)
+{
+    const jo_3d_morph                       *m;
+
+    if (morph < 0 || morph >= (int)model->morph_count)
+        return (0);
+    m = &model->morphs[morph];
+    return ((m->flags & JO_3D_MORPH_LOOP ? m->frame_count : m->frame_count - 1) * m->frame_ticks);
+}
+
+/** @brief The points (and the normals) of a time of a vertex animation in polygon data of the model
+ *  @param model Model
+ *  @param morph Index of the vertex animation
+ *  @param time Ticks (1/60 s)
+ *  @param d The polygon data written (model->morph_draw[k])
+ *  @return false if there is no such vertex animation
+ */
+static bool                                 jo_3d_model_morph_frame(const jo_3d_model * const model, const int morph, int time,
+                                                                    jo_3d_polygon_data * const d)
+{
+    const jo_3d_morph                       *m;
+    const short                             *f0;
+    const short                             *f1;
+    const unsigned char                     *n;
+    jo_fixed                                *out;
+    unsigned int                            total;
+    int                                     frame;
+    int                                     next;
+    int                                     frac;
+    int                                     scale;
+    int                                     v;
+    register unsigned int                   k;
+
+    if (morph < 0 || morph >= (int)model->morph_count || d == JO_NULL)
+        return (false);
+    m = &model->morphs[morph];
+    if (time < 0)
+        time = 0;
+    // (the frame and the fraction to the next one, like the keys of a skeleton: see jo_3d_model_get_pose())
+    if (m->flags & JO_3D_MORPH_LOOP)
+    {
+        total = (unsigned int)m->frame_count * m->frame_ticks;
+        if (total <= 0x7FFFFFFFu)
+            time -= jo_int_div(time, (int)total) * (int)total;
+        frame = jo_3d_model_key_of(time, m->frame_ticks, &frac);
+        next = frame + 1 < m->frame_count ? frame + 1 : 0;
+    }
+    else if ((unsigned int)time >= (unsigned int)(m->frame_count - 1) * m->frame_ticks)
+    {
+        frame = next = m->frame_count - 1;
+        JO_ZERO(frac);
+    }
+    else
+    {
+        frame = jo_3d_model_key_of(time, m->frame_ticks, &frac);
+        next = frame + 1;
+    }
+    f0 = (const short *)(model->morph_data + m->offset + frame * model->morph_frame_size);
+    f1 = (const short *)(model->morph_data + m->offset + next * model->morph_frame_size);
+    out = (jo_fixed *)d->points;
+    // A value: a + (b - a) x frac / 256 (x 256: under 2^23), then x 2^shift: x 2^(shift - 8), or x 2^shift then / 256 (a
+    // shift of 8 and multiplications: the shifts by a variable count are routines of the library of the compiler on the SH-2)
+    scale = model->morph_shift >= 8 ? 1 << (model->morph_shift - 8) : 1 << model->morph_shift;
+    for (JO_ZERO(k); k < d->point_count * 3; ++k)
+    {
+        v = (f0[k] * 256 + (f1[k] - f0[k]) * frac) * scale;
+        out[k] = model->morph_shift >= 8 ? v : jo_shift_right8(v);
+    }
+    // The normals of the polygons: the ones of the nearest frame (the polygons of the model when none is lit)
+    if (model->morph_normals && d->polygons != model->mesh->data.polygons)
+    {
+        n = (const unsigned char *)((frac < 128 ? f0 : f1) + d->point_count * 3);
+        for (JO_ZERO(k); k < d->polygon_count; ++k)
+            jo_3d_morph_normal(n[k], &d->polygons[k].normal);
+    }
+    return (true);
+}
+
+void                                        jo_3d_model_draw_morph(const jo_3d_model * const model, const int morph, const int time)
+{
+#ifdef JO_DEBUG
+    if (model == JO_NULL)
+    {
+        jo_core_error("model is null");
+        return;
+    }
+#endif
+    if (jo_3d_model_morph_frame(model, morph, time, model->morph_draw[0]))
+        __jo_3d_draw(model->morph_draw[0]);
+    else
+        __jo_3d_draw(&model->mesh->data);
+}
+
+bool                                        jo_3d_slave_model_draw_morph(const jo_3d_model * const model, const int morph, const int time)
+{
+#ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
+    // (the mesh of the slave CPU: jo_3d_slave_mesh_draw() reads the polygon data of a mesh)
+    if (!jo_3d_model_morph_frame(model, morph, time, model->morph_draw[1]))
+        return (jo_3d_slave_mesh_draw(model->mesh));
+    return (jo_3d_slave_mesh_draw((const jo_3d_mesh *)model->morph_draw[1]));
+#else
+    // (without the dual CPU module: drawn by the master CPU, like jo_3d_slave_model_draw_pose())
+    jo_3d_model_draw_morph(model, morph, time);
+    return (true);
+#endif
+}
+
 /** @brief Create a model
  *  @param file The data of the file used in place (JO_NULL: copies)
  *  @param storage One memory block for the model, its mesh, the attributes and the texture ids (see
@@ -1155,7 +1782,7 @@ bool                                        jo_3d_model_use_fast_memory(jo_3d_mo
  */
 static bool                                 jo_3d_model_chunk_seen(const unsigned char * const p, unsigned int * const seen)
 {
-    static const char                       tags[] = "PNTSQUADQMATMATLTIMGTEXTNTABCNRMVCOLGOURGRUPBONEANIM";
+    static const char                       tags[] = "PNTSQUADQMATMATLTIMGTEXTNTABCNRMVCOLGOURGRUPBONEANIMMRPHSKIN";
     unsigned int                            k;
 
     for (JO_ZERO(k); k < sizeof(tags) / 4; ++k)
@@ -1189,6 +1816,7 @@ static jo_3d_model                          *jo_3d_create_model(const unsigned c
     unsigned int                            vcol_count;
     unsigned int                            gouraud_size;
     unsigned int                            anim_size;
+    unsigned int                            morph_size;
     unsigned int                            seen;
     bool                                    wrong;
     register unsigned int                   k;
@@ -1199,6 +1827,7 @@ static jo_3d_model                          *jo_3d_create_model(const unsigned c
     JO_ZERO(vcol_count);
     JO_ZERO(gouraud_size);
     JO_ZERO(anim_size);
+    JO_ZERO(morph_size);
     if (data == JO_NULL || size < JO_3D_MODEL_HEADER_SIZE || !jo_3d_model_is_tag(data, "JOM1") ||
         (data[4] << 8 | data[5]) > JO_3D_MODEL_VERSION)
     {
@@ -1246,9 +1875,12 @@ static jo_3d_model                          *jo_3d_create_model(const unsigned c
         if (JO_3D_MODEL_WRONG_CHUNK(chunk, p, end))
             break;
         count = chunk >= 4 ? *(const unsigned int *)(p + 8) : 0;
-        // (the elements of a chunk in the chunk: a wrong count read after it)
+        // (the elements of a chunk in the chunk: a wrong count read after it. The vertex animations are optional: a chunk
+        // "MRPH" of another layout is skipped, see jo_3d_model_morphs_fit())
         if (!jo_3d_model_count_fits(p, chunk, count))
         {
+            if (jo_3d_model_is_tag(p, "MRPH"))
+                continue;
             wrong = true;
             break;
         }
@@ -1352,7 +1984,25 @@ static jo_3d_model                          *jo_3d_create_model(const unsigned c
             {
                 model->animation_count = count;
                 model->animations = (jo_3d_animation *)(model->animation_data + 4);
-                jo_3d_model_mark_duplicates(model);
+            }
+        }
+        else if (jo_3d_model_is_tag(p, "SKIN"))
+        {
+            model->skin = (const jo_3d_skin_point *)jo_3d_model_copy(model, p + 12, count * sizeof(jo_3d_skin_point));
+            if (model->skin != JO_NULL)
+                model->skin_count = count;
+        }
+        else if (jo_3d_model_is_tag(p, "MRPH"))
+        {
+            // (the frames are after the headers: the whole chunk is kept)
+            model->morph_data = (const unsigned char *)jo_3d_model_copy(model, p + 8, chunk);
+            morph_size = chunk;
+            if (model->morph_data != JO_NULL)
+            {
+                model->morph_count = count;
+                model->morph_shift = *(const unsigned short *)(model->morph_data + 4);
+                model->morph_normals = (*(const unsigned short *)(model->morph_data + 6) & 1) != 0;
+                model->morphs = (jo_3d_morph *)(model->morph_data + 8);
             }
         }
     }
@@ -1385,6 +2035,23 @@ static jo_3d_model                          *jo_3d_create_model(const unsigned c
             wrong = true;
     if (!wrong && !jo_3d_model_animations_fit(model, anim_size))
         JO_ZERO(model->animation_count);
+    // (a frame: the points (3 x s16), the normals of the polygons (u8), 4 bytes aligned)
+    model->morph_frame_size = (point_count * 6 + (model->morph_normals ? polygon_count : 0) + 3) & ~3u;
+    if (!wrong && model->morph_count > 0 && !jo_3d_model_morphs_fit(model, morph_size))
+        JO_ZERO(model->morph_count);
+    // (after the checks: the data of a chunk of another layout, kept in the file, are not written)
+    if (!wrong)
+        jo_3d_model_mark_duplicates(model);
+    // (a point of the skin out of the points, a bone out of the skeleton: the skeleton is rigid)
+    for (JO_ZERO(k); k < model->skin_count; ++k)
+        if (model->skin[k].point >= point_count || model->skin[k].bone >= model->bone_count ||
+            model->skin[k].other >= model->bone_count || model->skin[k].weight > JO_3D_SKIN_ONE)
+        {
+#ifdef JO_DEBUG
+            jo_core_error("Wrong skin point %d", (int)k);
+#endif
+            JO_ZERO(model->skin_count);
+        }
     if (wrong || points == JO_NULL || polygons == JO_NULL)
     {
 #ifdef JO_DEBUG
@@ -1425,6 +2092,14 @@ static jo_3d_model                          *jo_3d_create_model(const unsigned c
     }
     jo_3d_model_set_texture_options(model);
     jo_3d_model_set_attributes(model, gouraud);
+    if ((model->morph_count > 0 || model->skin_count > 0) && !jo_3d_model_create_morph_draw(model))
+    {
+#ifdef JO_DEBUG
+        jo_core_error("Out of memory");
+#endif
+        jo_3d_model_free(model, false);
+        return (JO_NULL);
+    }
     if (model->bone_count > 0 && !jo_3d_model_create_skeleton(model))
     {
 #ifdef JO_DEBUG
@@ -1436,11 +2111,13 @@ static jo_3d_model                          *jo_3d_create_model(const unsigned c
     return (model);
 }
 
+JO_LOW_WORK_RAM_CODE
 jo_3d_model                                 *jo_3d_create_model_from_memory(const unsigned char * const data, const unsigned int size)
 {
     return (jo_3d_create_model(data, size, JO_NULL, JO_NULL));
 }
 
+JO_LOW_WORK_RAM_CODE
 jo_3d_model                                 *jo_3d_create_model_in_place(const unsigned char * const data, const unsigned int size)
 {
     jo_3d_model                             *model;
@@ -1478,6 +2155,7 @@ jo_3d_model                                 *jo_3d_create_model_in_place(const u
     return (model);
 }
 
+JO_LOW_WORK_RAM_CODE
 void                                        jo_3d_free_model(jo_3d_model * const model)
 {
     jo_3d_model_free(model, true);
@@ -1486,6 +2164,7 @@ void                                        jo_3d_free_model(jo_3d_model * const
 /** @brief Free a model
  *  @param free_file Free the data of the file too (else the caller frees them)
  */
+JO_LOW_WORK_RAM_CODE
 static void                                 jo_3d_model_free(jo_3d_model * const model, const bool free_file)
 {
     if (model == JO_NULL)
@@ -1497,6 +2176,7 @@ static void                                 jo_3d_model_free(jo_3d_model * const
         __jo_3d_forget_tint(&model->mesh->data);
         __jo_3d_forget_environment(&model->mesh->data);
     }
+    jo_3d_model_free_morph_draw(model);
     jo_3d_free_gouraud_tables(model->gouraud_tables, model->gouraud_table_count);
     if (model->single_block)
     {
@@ -1550,6 +2230,10 @@ static void                                 jo_3d_model_free(jo_3d_model * const
         jo_free(model->bone_children);
     if (model->animation_data != JO_NULL)
         jo_free((void *)model->animation_data);
+    if (model->morph_data != JO_NULL)
+        jo_free((void *)model->morph_data);
+    if (model->skin != JO_NULL)
+        jo_free((void *)model->skin);
     jo_free(model);
 }
 
@@ -1625,6 +2309,7 @@ bool                                        jo_3d_model_set_environment(jo_3d_mo
 
 #ifdef JO_COMPILE_WITH_FS_SUPPORT
 
+JO_LOW_WORK_RAM_CODE
 void                                        jo_3d_model_pool_init(jo_3d_model_pool * const pool, const unsigned int block_size,
                                                                   const unsigned int bytes)
 {
@@ -1635,6 +2320,7 @@ void                                        jo_3d_model_pool_init(jo_3d_model_po
     JO_ZERO(pool->block_count);
 }
 
+JO_LOW_WORK_RAM_CODE
 jo_3d_model                                 *jo_3d_model_pool_read(jo_3d_model_pool * const pool, jo_file * const file, const unsigned int size)
 {
     unsigned int                            size4;
@@ -1677,7 +2363,7 @@ jo_3d_model                                 *jo_3d_model_pool_read(jo_3d_model_p
         return (JO_NULL);
     // The chunks used only while the model was created, last in the file: the embedded textures, the names of the
     // textures, the gouraud colors are in the VRAM now. The next model is read over them, an end chunk in their place
-    // (rally demo: about 150 KB less for a track)
+    // (about 150 KB less for a level of a 3D game)
     used = size4;
     cut = JO_NULL;
     for (p = data + JO_3D_MODEL_HEADER_SIZE; p + 8 <= data + size; p += 8 + chunk)
@@ -1708,6 +2394,7 @@ jo_3d_model                                 *jo_3d_model_pool_read(jo_3d_model_p
     return (model);
 }
 
+JO_LOW_WORK_RAM_CODE
 void                                        jo_3d_model_pool_free(jo_3d_model_pool * const pool)
 {
     register int                            k;

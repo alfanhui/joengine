@@ -48,6 +48,8 @@
 #include "internal/vdp1_command_pipeline.h"
 #include "internal/sprites.h"
 #include "internal/3d.h"
+#include "jo/model.h"
+#include "internal/model.h"
 
 /*
 ** MACROS
@@ -57,7 +59,7 @@
 ** GLOBALS
 */
 
-jo_sprite_attributes    __jo_sprite_attributes = {0, 0, 0, 0, JO_NO_ZOOM, JO_NO_ZOOM, JO_VDP1_NO_WINDOW};
+jo_sprite_attributes    __jo_sprite_attributes = {0, 0, 0, 0, JO_NO_ZOOM, JO_NO_ZOOM, JO_VDP1_NO_WINDOW, 0};
 jo_pos3D                __jo_sprite_pos = {0, 0, 120};
 jo_texture_definition   __jo_sprite_def[JO_MAX_SPRITE] __attribute__((used, externally_visible));
 jo_picture_definition   __jo_sprite_pic[JO_MAX_SPRITE];
@@ -78,10 +80,28 @@ int				        __jo_hash_table[JO_MAX_SPRITE];
 static int				__jo_sprite_addr = 0;
 static int				__jo_sprite_id = -1;
 
+/** @brief Bytes of the pixels of a texture: pixels x 4 >> color mode (JO_VDP1_TEXTURE_SIZE_SHIFT_xxx, 0 to 3)
+ *  @param pixels Width x height
+ *  @param color_mode Shift of its color mode
+ *  @return Bytes
+ *  @remarks Constant shifts: a shift by a variable is a call to a routine of the compiler on the SH-2
+ */
+static  __jo_force_inline unsigned int  jo_sprite_texture_bytes(const unsigned int pixels, const unsigned int color_mode)
+{
+    unsigned int                        bytes;
+
+    bytes = JO_MULT_BY_4(pixels);
+    if (color_mode & 2)
+        bytes >>= 2;
+    if (color_mode & 1)
+        bytes >>= 1;
+    return (bytes);
+}
+
 static  __jo_force_inline unsigned int	__jo_get_next_sprite_address(const unsigned int sprite_address, const unsigned int sprite_width,
         const unsigned int sprite_height, const unsigned int sprite_color_mode)
 {
-    return ((sprite_address) + (((((sprite_width) * (sprite_height) * 4) >> (sprite_color_mode)) + 0x1f) & 0x7ffe0));
+    return ((sprite_address) + ((jo_sprite_texture_bytes((sprite_width) * (sprite_height), sprite_color_mode) + 0x1f) & 0x7ffe0));
 }
 
 int                         jo_sprite_usage_percent(void)
@@ -195,10 +215,10 @@ int				            __jo_sprite_replace(const jo_img * const img, const int sprit
     picture->data = img->data;
     if (async)
         jo_dma_copy_async(picture->data, (void *)(JO_VDP1_VRAM + JO_MULT_BY_8(texture->adr)),
-                          (unsigned int)((JO_MULT_BY_4(texture->width * texture->height)) >> (picture->color_mode)));
+                          jo_sprite_texture_bytes(texture->width * texture->height, picture->color_mode));
     else
         jo_dma_copy(picture->data, (void *)(JO_VDP1_VRAM + JO_MULT_BY_8(texture->adr)),
-                    (unsigned int)((JO_MULT_BY_4(texture->width * texture->height)) >> (picture->color_mode)));
+                    jo_sprite_texture_bytes(texture->width * texture->height, picture->color_mode));
     picture->data = (void *)(JO_VDP1_VRAM + JO_MULT_BY_8(texture->adr));
     __jo_sprite_end_codes[sprite_id] = false;
     __jo_sprite_mean_color[sprite_id] = 0;
@@ -218,11 +238,13 @@ int				            jo_sprite_replace(const jo_img * const img, const int sprite_
  *  @param prefix Bytes kept free before the pixels (a multiple of 32: the color lookup table of a 16 colors texture, see
  *  jo_sprite_add_4bits_lut()), freed with the sprite
  */
+JO_LOW_WORK_RAM_CODE
 static int                  __internal_jo_sprite_add_prefix(void * const data, const unsigned short width, const unsigned short height,
                                                             const unsigned short cmode, const unsigned int prefix)
 {
     jo_texture_definition   *texture;
     jo_picture_definition   *picture;
+    unsigned int            pixels;
 
     if ((__jo_sprite_id + 1) >= JO_MAX_SPRITE)
     {
@@ -242,10 +264,13 @@ static int                  __internal_jo_sprite_add_prefix(void * const data, c
                            texture->height,
                            picture->color_mode);
     }
-    // Not enough VDP1 VRAM for the texture (the size in 64 bits: __jo_get_next_sprite_address() masks it to the 512 KB of the
-    // VRAM, so a texture of 512 KB or more would pass as a small one and its copy would overwrite what follows)
-    if (JO_VDP1_VRAM + __jo_get_next_sprite_address(__jo_sprite_addr + prefix, width, height, cmode) > JO_VDP1_USER_AREA_END_ADDR ||
-        ((unsigned long long)width * height * 4 >> cmode) > (unsigned long long)(JO_VDP1_USER_AREA_END_ADDR - (JO_VDP1_VRAM + __jo_sprite_addr + prefix)))
+    pixels = (unsigned int)width * height;
+    // Not enough VDP1 VRAM for the texture (1M pixels or more: 512 KB or more in any color mode. __jo_get_next_sprite_address()
+    // masks the size to the 512 KB of the VRAM, so a texture of 512 KB or more would pass as a small one and its copy would
+    // overwrite what follows)
+    if (pixels >= 0x100000 ||
+        JO_VDP1_VRAM + __jo_get_next_sprite_address(__jo_sprite_addr + prefix, width, height, cmode) > JO_VDP1_USER_AREA_END_ADDR ||
+        jo_sprite_texture_bytes(pixels, cmode) > JO_VDP1_USER_AREA_END_ADDR - (JO_VDP1_VRAM + __jo_sprite_addr + prefix))
     {
 #ifdef JO_DEBUG
         jo_core_error("Out of sprite memory (%dx%d)", width, height);
@@ -271,7 +296,7 @@ static int                  __internal_jo_sprite_add_prefix(void * const data, c
     picture->data = (void *)(JO_VDP1_VRAM + JO_MULT_BY_8(texture->adr));
 
     if (data != JO_NULL)
-        jo_dma_copy(data, picture->data, (unsigned int)((JO_MULT_BY_4(width * height)) >> cmode));
+        jo_dma_copy(data, picture->data, jo_sprite_texture_bytes(pixels, cmode));
 
     return (__jo_sprite_id);
 }
@@ -294,6 +319,7 @@ int				jo_sprite_add(const jo_img * const img)
     return __internal_jo_sprite_add(img->data, img->width, img->height, JO_VDP1_TEXTURE_SIZE_SHIFT_32K_COLORS);
 }
 
+JO_LOW_WORK_RAM_CODE
 int                         __jo_sprite_add_4bits(const void * const pixels, const unsigned short width, const unsigned short height,
                                                   const unsigned short lut)
 {
@@ -305,6 +331,7 @@ int                         __jo_sprite_add_4bits(const void * const pixels, con
     return (id);
 }
 
+JO_LOW_WORK_RAM_CODE
 int                         jo_sprite_add_4bits_lut(const unsigned char * const pixels, const unsigned short width, const unsigned short height,
                                                     const jo_color * const lut)
 {
@@ -327,6 +354,7 @@ int                         jo_sprite_add_4bits_lut(const unsigned char * const 
     return (id);
 }
 
+JO_LOW_WORK_RAM_CODE
 int                         jo_sprite_add_image_4bits_lut(const jo_img * const img)
 {
     jo_color                lut[16];
@@ -357,7 +385,7 @@ int                         jo_sprite_add_image_4bits_lut(const jo_img * const i
     // The table: the colors of the image in the order of their first pixel (0: transparent, the entry 0 of the table),
     // and the pixels, 2 per byte, the left pixel in the high bits. In one pass, the color of the previous pixel kept (most
     // pixels have it: the table searched for about 1 pixel in 10; 2 passes and a search per pixel were 5 % of the loading
-    // of the rally demo)
+    // of a 3D game)
     lut[0] = JO_COLOR_Transparent;
     colors = 1;
     last = JO_COLOR_Transparent;
@@ -400,6 +428,7 @@ int                         jo_sprite_add_image_4bits_lut(const jo_img * const i
     return (id);
 }
 
+JO_LOW_WORK_RAM_CODE
 int				            jo_sprite_add_8bits_image(const jo_img_8bits * const img)
 {
 #ifdef JO_DEBUG
@@ -412,6 +441,7 @@ int				            jo_sprite_add_8bits_image(const jo_img_8bits * const img)
     return __internal_jo_sprite_add(img->data, img->width, img->height, JO_VDP1_TEXTURE_SIZE_SHIFT_256_COLORS);
 }
 
+JO_LOW_WORK_RAM_CODE
 bool                        jo_sprite_add_end_codes(const int sprite_id)
 {
     jo_color                *line;
@@ -458,6 +488,8 @@ void                        jo_sprite_free_from(const int sprite_id)
     // The mipmaps, the tiles and the flags of the textures freed
     __jo_3d_forget_sprites_from(sprite_id);
     __jo_3d_gouraud_pool_freed(sprite_id);
+    // (the copies of the color lookup tables of the models: maybe among the sprites freed)
+    __jo_3d_model_forget_lit_luts();
     // The last sprite is included
     for (i = sprite_id; i <= __jo_sprite_id; ++i)
     {
@@ -466,6 +498,9 @@ void                        jo_sprite_free_from(const int sprite_id)
             jo_3d_free_sprite_quad(i);
     }
 #endif // JO_COMPILE_WITH_3D_SUPPORT
+#ifdef JO_COMPILE_WITH_VIDEO_SUPPORT
+    __jo_video_sprites_freed(sprite_id);
+#endif
     if (sprite_id == 0)
         JO_ZERO(__jo_sprite_addr);
     else
@@ -549,6 +584,10 @@ void                    jo_sprite_draw_4p_fixed(const int sprite_id, const jo_po
 
     if (sprite_id < 0)
         return;
+#ifdef JO_DEBUG
+    if (__JO_SPRITE_IS_MISSING(sprite_id))
+        return;
+#endif
     __jo_set_sprite_attributes(&attr, sprite_id);
     // (centered: the points as they are, no copy; the standing sprites of the 3D, hundreds a frame)
     if (centered_style_coordinates)
@@ -672,6 +711,10 @@ void                    jo_sprite_draw_rotate(const int sprite_id, const jo_pos3
     // No sprite (for instance jo_get_video_sprite() when the movie is stopped)
     if (sprite_id < 0)
         return;
+#ifdef JO_DEBUG
+    if (__JO_SPRITE_IS_MISSING(sprite_id))
+        return;
+#endif
     jo_sprite_compute_position(sprite_id, pos, centered_style_coordinates, &position);
     __jo_set_sprite_attributes(&attr, sprite_id);
     vdp1_angle = jo_DEGtoANG_int(angle);

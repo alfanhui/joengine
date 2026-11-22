@@ -62,8 +62,13 @@
 #include "jo/3d.h"
 #include "jo/vdp2_malloc.h"
 #include "jo/glow.h"
+#include "jo/vdp2.h"
+#include "jo/transparency.h"
 #include "internal/vdp1_command_pipeline.h"
 #include "internal/vdp2_malloc.h"
+#include "internal/sprites.h"
+#include "internal/3d.h"
+#include "internal/core.h"
 
 #ifdef JO_COMPILE_WITH_3D_SUPPORT
 
@@ -223,6 +228,36 @@ static unsigned char                __jo_glow_add_levels[16][16];
 static bool                         (*__jo_glow_hit)(const jo_pos3D_fixed * const origin, const jo_pos3D_fixed * const dir, const jo_fixed max_t) = JO_NULL;
 static int                          __jo_glow_ray_cursor = 0;
 static bool                         (*__jo_glow_clip)(const jo_pos3D_fixed * const position, jo_3d_rect * const rect) = JO_NULL;
+
+/*
+** The glows in the transparency layer (JO_3D_GLOW_LAYER): a 16 colors texture of each shape, its levels of light (1 to
+** JO_GLOW_LAYER_LEVELS, 0: transparent), and a color lookup table of each glow drawn (its color for each level), the
+** tables of the frames in turn (the VDP1 draws a frame after it is built)
+*/
+
+/** @brief Where the glows are drawn */
+static jo_3d_glow_mode              __jo_glow_mode = JO_3D_GLOW_VDP2;
+/** @brief Levels of light of the textures (the index 15 is the end code of the VDP1) */
+#define JO_GLOW_LAYER_LEVELS                (14)
+/** @brief Sizes of the textures of the discs (pixels of the layer, multiples of 8): a disc is drawn with the nearest size,
+ *  almost to the scale 1 (the VDP1 doesn't filter a texture made smaller: it skips texels, the thin rays were lost) */
+#define JO_GLOW_LAYER_SIZES                 (6)
+static const unsigned char                  __jo_glow_layer_sizes[JO_GLOW_LAYER_SIZES] = {16, 24, 32, 40, 48, 64};
+#define JO_GLOW_LAYER_DISC_SIZE             (64)
+/** @brief Size of the textures of the rectangles (their light: a quarter of it on each side; stretched to the rectangle) */
+#define JO_GLOW_LAYER_RECT_SIZE             (32)
+#define JO_GLOW_LAYER_RECT_MARGIN           (JO_GLOW_LAYER_RECT_SIZE / 4)
+/** @brief Bytes of a color lookup table (16 colors), of a line of a 16 colors texture of 64 pixels */
+#define JO_GLOW_LUT_BYTES                   (16 * sizeof(jo_color))
+/** @brief The smallest disc drawn with all its light (pixels of the screen): smaller, less light */
+#define JO_GLOW_LAYER_MIN_DIAMETER          (8)
+/** @brief The textures of the shapes (sprite ids, -1: not built): the discs in each size, the rectangles in one */
+static int                          __jo_glow_layer_textures[4][JO_GLOW_LAYER_SIZES] = {{-1, -1, -1, -1, -1, -1}, {-1, -1, -1, -1, -1, -1},
+                                                                                    {-1, -1, -1, -1, -1, -1}, {-1, -1, -1, -1, -1, -1}};
+/** @brief The color lookup tables of the glows: JO_GLOW_STATES frames of JO_3D_GLOW_LAYER_SHOWN tables, in the pixels of a
+ *  sprite (its first table: VRAM address / 8, see __jo_sprite_lut) */
+static int                          __jo_glow_lut_sprite = -1;
+static jo_color                     *__jo_glow_luts = JO_NULL;
 
 /*
 ** VRAM
@@ -424,6 +459,71 @@ static jo_fixed                     jo_glow_piece_light(const int kind, const in
     }
 }
 
+/** @brief Columns of a block of jo_glow_write_disc_block() at most (the biggest disc and a cell more) */
+#define JO_GLOW_DISC_COLUMNS                (8 * (128 / 8 + 1))
+
+/** @brief Write a block of cells of a disc from the light of a quarter of the disc (__jo_glow_lut, built for its size): the
+ *  pixels of jo_glow_write_block() with a disc (kind 0 or 1), without a call for each pixel
+ *  @param cell First cell
+ *  @param w Width of the block (cells, JO_GLOW_DISC_COLUMNS / 8 at most)
+ *  @param h Height (cells)
+ *  @param ox Middle of the disc in the block (half pixels)
+ *  @param oy
+ *  @return The cell after the block
+ */
+static unsigned char                *jo_glow_write_disc_block(unsigned char *cell, const int w, const int h, const int ox,
+                                                              const int oy)
+{
+    volatile unsigned short         *dst;
+    const unsigned short            *dither;
+    const unsigned char             *c;
+    const jo_fixed                  *row;
+    unsigned char                   column[JO_GLOW_DISC_COLUMNS];
+    unsigned int                    word;
+    int                             half;
+    int                             cx;
+    int                             cy;
+    int                             x;
+    int                             y;
+    int                             i;
+    int                             d;
+
+    half = __jo_glow_lut_half;
+    for (x = 0; x < 8 * w; ++x)
+    {
+        d = 2 * x + 1 - ox;
+        d = JO_ABS(d) >> 1;
+        column[x] = (unsigned char)(d < half ? d : 255);
+    }
+    for (cy = 0; cy < h; ++cy)
+        for (cx = 0; cx < w; ++cx, cell += 32)
+        {
+            dst = (volatile unsigned short *)cell;
+            for (y = 0; y < 8; ++y)
+            {
+                d = 2 * (cy * 8 + y) + 1 - oy;
+                d = JO_ABS(d) >> 1;
+                // (no light: level 0 with any dither)
+                if (d >= half)
+                {
+                    *dst++ = 0;
+                    *dst++ = 0;
+                    continue;
+                }
+                row = __jo_glow_lut + d * half;
+                dither = __jo_glow_bayer + (y & 3) * 4;
+                for (x = 0; x < 8; x += 4)
+                {
+                    c = column + cx * 8 + x;
+                    for (JO_ZERO(i), JO_ZERO(word); i < 4; ++i)
+                        word = (word << 4) | jo_glow_level(dither[i], jo_glow_level_base(c[i] != 255 ? row[c[i]] : 0));
+                    *dst++ = (unsigned short)word;
+                }
+            }
+        }
+    return (cell);
+}
+
 /** @brief Write a block of cells (16 colors: 4 bits per pixel, the left pixel in the high bits; the cells line by line)
  *  @param cell First cell
  *  @param w Width of the block (cells)
@@ -454,6 +554,8 @@ static unsigned char                *jo_glow_write_block(unsigned char *cell, co
     int                             qx;
     int                             qy;
 
+    if (kind <= 1 && __jo_glow_lut_half == a / 2 && !flip_x && !flip_y && !transpose && 8 * w <= JO_GLOW_DISC_COLUMNS)
+        return (jo_glow_write_disc_block(cell, w, h, ox, oy));
     for (cy = 0; cy < h; ++cy)
         for (cx = 0; cx < w; ++cx, cell += 32)
         {
@@ -480,6 +582,55 @@ static unsigned char                *jo_glow_write_block(unsigned char *cell, co
     return (cell);
 }
 
+/** @brief Write a block of cells from the light of its pixels (the pixels of jo_glow_write_block(), its light computed once
+ *  for the blocks that are mirrors of each other)
+ *  @param cell First cell
+ *  @param w Width of the block (cells)
+ *  @param h Height (cells)
+ *  @param light Light of the pixels of the block not flipped (8 w x 8 h, line by line)
+ *  @param flip_x The block is the mirror in X of the light, flip_y in Y
+ *  @param flip_y
+ *  @return The cell after the block
+ */
+static unsigned char                *jo_glow_write_lights(unsigned char *cell, const int w, const int h, const jo_fixed * const light,
+                                                          const bool flip_x, const bool flip_y)
+{
+    volatile unsigned short         *dst;
+    const unsigned short            *dither;
+    const jo_fixed                  *row;
+    unsigned int                    word;
+    int                             cx;
+    int                             cy;
+    int                             x;
+    int                             y;
+    int                             i;
+    int                             px;
+    int                             py;
+
+    for (cy = 0; cy < h; ++cy)
+        for (cx = 0; cx < w; ++cx, cell += 32)
+        {
+            dst = (volatile unsigned short *)cell;
+            for (y = 0; y < 8; ++y)
+            {
+                py = cy * 8 + y;
+                dither = __jo_glow_bayer + (py & 3) * 4;
+                row = light + (flip_y ? h * 8 - 1 - py : py) * w * 8;
+                for (x = 0; x < 8; x += 4)
+                {
+                    for (JO_ZERO(i), JO_ZERO(word); i < 4; ++i)
+                    {
+                        px = cx * 8 + x + i;
+                        word = (word << 4) | jo_glow_level(dither[px & 3],
+                                                           jo_glow_level_base(row[flip_x ? w * 8 - 1 - px : px]));
+                    }
+                    *dst++ = (unsigned short)word;
+                }
+            }
+        }
+    return (cell);
+}
+
 /** @brief The cells of a rectangle or a frame (see jo_glow_cell_name()): 4 corners, the edges (top, bottom, left, right),
  *  the middle (filled rectangle)
  *  @param cell First cell
@@ -493,17 +644,33 @@ static unsigned char                *jo_glow_write_rect(unsigned char *cell, con
     int                             o;
     int                             kc;
     int                             ke;
+    int                             x;
+    int                             y;
 
     n = frame ? 2 * c : c;
     // (the corner of the rectangle in the block of the top left corner: half pixels)
     o = 2 * 8 * c;
     kc = frame ? 5 : 2;
     ke = frame ? 6 : 3;
-    // The corners: top left, top right, bottom left, bottom right
-    cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, false, false, false);
-    cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, true, false, false);
-    cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, false, true, false);
-    cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, true, true, false);
+    // The corners: top left, top right, bottom left, bottom right (mirrors: the light of the pixels computed once, in the
+    // memory of the quarter discs, free after the discs)
+    if (__jo_glow_lut != JO_NULL && 8 * n <= 64)
+    {
+        for (y = 0; y < 8 * n; ++y)
+            for (x = 0; x < 8 * n; ++x)
+                __jo_glow_lut[y * 8 * n + x] = jo_glow_piece_light(kc, x, y, 8 * c, o, o);
+        cell = jo_glow_write_lights(cell, n, n, __jo_glow_lut, false, false);
+        cell = jo_glow_write_lights(cell, n, n, __jo_glow_lut, true, false);
+        cell = jo_glow_write_lights(cell, n, n, __jo_glow_lut, false, true);
+        cell = jo_glow_write_lights(cell, n, n, __jo_glow_lut, true, true);
+    }
+    else
+    {
+        cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, false, false, false);
+        cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, true, false, false);
+        cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, false, true, false);
+        cell = jo_glow_write_block(cell, n, n, kc, 8 * c, o, o, true, true, false);
+    }
     // The edges: top (a column of n cells), bottom, left (a line of n cells), right
     cell = jo_glow_write_block(cell, 1, n, ke, 8 * c, 0, o, false, false, false);
     cell = jo_glow_write_block(cell, 1, n, ke, 8 * c, 0, o, false, true, false);
@@ -614,11 +781,6 @@ static bool                         jo_glow_build_vram(void)
                                        8 * n + (m >> 1) * 8, false, false, false);
         }
     }
-    if (__jo_glow_lut != JO_NULL)
-    {
-        jo_free(__jo_glow_lut);
-        __jo_glow_lut = JO_NULL;
-    }
     __jo_glow_lut_half = 0;
     // The rectangles and the frames
     for (k = 0; k < JO_GLOW_MARGINS; ++k)
@@ -627,6 +789,11 @@ static bool                         jo_glow_build_vram(void)
         cell = jo_glow_write_rect(cell, k + 1, false);
         __jo_glow_frame_char[k] = jo_glow_character(cell);
         cell = jo_glow_write_rect(cell, k + 1, true);
+    }
+    if (__jo_glow_lut != JO_NULL)
+    {
+        jo_free(__jo_glow_lut);
+        __jo_glow_lut = JO_NULL;
     }
     // The pool of the overlaps, the cells of the moved discs
     __jo_glow_pool = cell;
@@ -918,6 +1085,24 @@ static void                         jo_glow_overlaps(jo_glow_state * const state
 ** VBLANK: the layer shows the glows of the frame displayed
 */
 
+/** @brief Empty the cells of the map of the glows displayed (__jo_glow_displayed): the only cells written since the map
+ *  was emptied
+ *  @param map The map
+ */
+static  __jo_force_inline void      jo_glow_clear_displayed(volatile unsigned short * const map)
+{
+    int                             k;
+    int                             x;
+    int                             y;
+
+    for (k = 0; k < __jo_glow_displayed.count; ++k)
+        for (y = __jo_glow_displayed.box[k][1]; y <= __jo_glow_displayed.box[k][3]; ++y)
+            for (x = __jo_glow_displayed.box[k][0]; x <= __jo_glow_displayed.box[k][2]; ++x)
+                map[(y & 63) * JO_GLOW_MAP_WIDTH + (x & 63)] = __jo_glow_empty_char;
+    for (k = 0; k < __jo_glow_displayed.overlap_count; ++k)
+        map[__jo_glow_displayed.overlap_cell[k]] = __jo_glow_empty_char;
+}
+
 static void                         jo_glow_vblank(void)
 {
     const jo_glow_state             *state;
@@ -938,12 +1123,7 @@ static void                         jo_glow_vblank(void)
         return;
     map = __jo_glow_map;
     // The cells of the frame before: empty
-    for (k = 0; k < __jo_glow_displayed.count; ++k)
-        for (y = __jo_glow_displayed.box[k][1]; y <= __jo_glow_displayed.box[k][3]; ++y)
-            for (x = __jo_glow_displayed.box[k][0]; x <= __jo_glow_displayed.box[k][2]; ++x)
-                map[(y & 63) * JO_GLOW_MAP_WIDTH + (x & 63)] = __jo_glow_empty_char;
-    for (k = 0; k < __jo_glow_displayed.overlap_count; ++k)
-        map[__jo_glow_displayed.overlap_cell[k]] = __jo_glow_empty_char;
+    jo_glow_clear_displayed(map);
     // The scroll: the grid of the cells on the glow seen the most
     JO_VDP2_SCXN2 = (unsigned short)((-(int)state->fine_x) & 0x7FF);
     JO_VDP2_SCYN2 = (unsigned short)((-(int)state->fine_y) & 0x7FF);
@@ -991,6 +1171,270 @@ static void                         jo_glow_vblank(void)
         __jo_glow_displayed.overlap_cell[k] = state->overlap_cell[k];
     }
     __jo_glow_displayed.overlap_count = state->overlap_count;
+}
+
+/** @brief Light of a texel of a rectangle (RECT: lit inside, falling around it; FRAME: lit on its outline)
+ *  @param x Texel (0 to JO_GLOW_LAYER_RECT_SIZE - 1)
+ *  @param y Texel
+ *  @param frame The outline only
+ *  @return Light (Q16, 0 to 1)
+ */
+static jo_fixed                     jo_glow_layer_rect_light(const int x, const int y, const bool frame)
+{
+    const int                       inner0 = JO_GLOW_LAYER_RECT_MARGIN * 2;
+    const int                       inner1 = (JO_GLOW_LAYER_RECT_SIZE - JO_GLOW_LAYER_RECT_MARGIN) * 2;
+    int                             px;
+    int                             py;
+    int                             dx;
+    int                             dy;
+    int                             d;
+
+    // (half pixels: the middle of the texel)
+    px = x * 2 + 1;
+    py = y * 2 + 1;
+    dx = px < inner0 ? inner0 - px : (px > inner1 ? px - inner1 : 0);
+    dy = py < inner0 ? inner0 - py : (py > inner1 ? py - inner1 : 0);
+    if (frame)
+    {
+        // (inside: the distance to the nearest edge)
+        if (dx == 0 && dy == 0)
+            d = JO_MIN(JO_MIN(px - inner0, inner1 - px), JO_MIN(py - inner0, inner1 - py));
+        else
+            d = (int)jo_sqrt((unsigned int)(dx * dx + dy * dy));
+        return (jo_glow_fall(d, JO_GLOW_LAYER_RECT_MARGIN * 2));
+    }
+    if (dx == 0 && dy == 0)
+        return (JO_GLOW_RECT_LIGHT);
+    d = (int)jo_sqrt((unsigned int)(dx * dx + dy * dy));
+    return (jo_fixed_mult(JO_GLOW_RECT_LIGHT, jo_glow_fall(d, JO_GLOW_LAYER_RECT_MARGIN * 2)));
+}
+
+/** @brief Forget the sprites of the layer that are freed (see __jo_3d_glow_sprites_freed): added again at the next
+ *  jo_3d_glows_draw(). The table of the colors is the last sprite added: freed with any texture freed
+ *  @param sprite_id First sprite freed
+ */
+static void                         jo_glow_layer_sprites_freed(const int sprite_id)
+{
+    int                             shape;
+    int                             k;
+
+    for (shape = JO_3D_GLOW_STAR; shape <= JO_3D_GLOW_FRAME; ++shape)
+        for (k = 0; k < JO_GLOW_LAYER_SIZES; ++k)
+            if (__jo_glow_layer_textures[shape][k] >= sprite_id)
+                __jo_glow_layer_textures[shape][k] = -1;
+    if (__jo_glow_lut_sprite >= sprite_id)
+    {
+        __jo_glow_lut_sprite = -1;
+        __jo_glow_luts = JO_NULL;
+    }
+}
+
+/** @brief The textures of the shapes and the color lookup tables of the layer (once, again after they are freed)
+ *  @return false if out of memory
+ */
+static bool                         jo_glow_layer_build(void)
+{
+    const unsigned int              lut_rows = JO_GLOW_STATES * JO_3D_GLOW_LAYER_SHOWN + 1;
+    const unsigned int              row_bytes = JO_GLOW_LAYER_DISC_SIZE / 2;
+    jo_color                        gray[16];
+    void                            *lut_rows_address;
+    unsigned char                   *pixels;
+    unsigned char                   level;
+    unsigned int                    bytes;
+    int                             shape;
+    int                             size;
+    int                             k;
+    int                             x;
+    int                             y;
+    jo_fixed                        q;
+
+    if (__jo_glow_luts != JO_NULL)
+        return (true);
+    __jo_3d_glow_sprites_freed = jo_glow_layer_sprites_freed;
+    bytes = JO_MAX(lut_rows * row_bytes, (unsigned int)(JO_GLOW_LAYER_DISC_SIZE * JO_GLOW_LAYER_DISC_SIZE / 2));
+    if ((pixels = (unsigned char *)jo_malloc(bytes)) == JO_NULL)
+        return (false);
+    // (the table of the textures: never used, the table of each glow replaces it)
+    for (x = 0; x < 16; ++x)
+        gray[x] = JO_COLOR_RGB(x * 16, x * 16, x * 16);
+    for (shape = JO_3D_GLOW_STAR; shape <= JO_3D_GLOW_FRAME; ++shape)
+        for (k = 0; k < (shape >= JO_3D_GLOW_RECT ? 1 : JO_GLOW_LAYER_SIZES); ++k)
+        {
+            if (__jo_glow_layer_textures[shape][k] >= 0)
+                continue;
+            size = shape >= JO_3D_GLOW_RECT ? JO_GLOW_LAYER_RECT_SIZE : __jo_glow_layer_sizes[k];
+            jo_memset(pixels, 0, (unsigned int)(size * size / 2));
+            for (y = 0; y < size; ++y)
+                for (x = 0; x < size; ++x)
+                {
+                    if (shape >= JO_3D_GLOW_RECT)
+                        q = jo_glow_layer_rect_light(x, y, shape == JO_3D_GLOW_FRAME);
+                    else
+                        // (half pixels from the middle: the disc fills the texture)
+                        q = jo_glow_light(JO_ABS(x * 2 + 1 - size), JO_ABS(y * 2 + 1 - size), size, shape == JO_3D_GLOW_STAR);
+                    // (the ordered dither of the glows of the VDP2 between two levels: no ring)
+                    level = (unsigned char)JO_MIN(((unsigned int)q * JO_GLOW_LAYER_LEVELS + (1 << 11) + __jo_glow_bayer[(y & 3) * 4 + (x & 3)]) >> 16,
+                                                  JO_GLOW_LAYER_LEVELS);
+                    // (2 pixels a byte, the left one in the high bits)
+                    pixels[(y * size + x) >> 1] |= (unsigned char)((x & 1) ? level : level << 4);
+                }
+            __jo_glow_layer_textures[shape][k] = jo_sprite_add_4bits_lut(pixels, (unsigned short)size, (unsigned short)size, gray);
+            if (__jo_glow_layer_textures[shape][k] < 0)
+            {
+                jo_free(pixels);
+                return (false);
+            }
+        }
+    // The tables: the lines of a sprite of 64 pixels (32 bytes, a table each), a line more to align them on 32 bytes
+    jo_memset(pixels, 0, lut_rows * row_bytes);
+    __jo_glow_lut_sprite = jo_sprite_add_4bits_lut(pixels, JO_GLOW_LAYER_DISC_SIZE, (unsigned short)lut_rows, gray);
+    jo_free(pixels);
+    if (__jo_glow_lut_sprite < 0)
+        return (false);
+    lut_rows_address = jo_sprite_get_raw_data(__jo_glow_lut_sprite);
+    __jo_glow_luts = (jo_color *)(((unsigned int)lut_rows_address + JO_GLOW_LUT_BYTES - 1) & ~(JO_GLOW_LUT_BYTES - 1));
+    return (true);
+}
+
+/** @brief The glows seen in the transparency layer (see jo_3d_glows_draw(): where each one is on the screen)
+ *  @param sx Middle of each glow (pixels from the middle of the screen)
+ *  @param sy Middle
+ *  @param diameter Disc: its diameter; rectangle: the width of its light (pixels of the screen)
+ *  @param half_w Rectangle: its half size on the screen
+ *  @param half_h Rectangle
+ *  @param depth Depth of each glow (camera space)
+ *  @param rect Rectangle of clip of each glow
+ *  @param on_screen The glows on the screen
+ */
+static void                         jo_glow_layer_draw(const short * const sx, const short * const sy, const short * const diameter,
+                                                       const short * const half_w, const short * const half_h,
+                                                       const jo_fixed * const depth, const jo_3d_rect * const rect,
+                                                       const bool * const on_screen)
+{
+    jo_glow                         *glow;
+    jo_color                        *lut;
+    jo_pos2D_fixed                  corners[4];
+    jo_3d_rect                      rects[JO_3D_GLOW_LAYER_RECTS];
+    unsigned char                   order[JO_3D_GLOW_LAYER_SHOWN];
+    unsigned char                   group[JO_3D_GLOW_LAYER_SHOWN];
+    int                             score[JO_3D_GLOW_LAYER_SHOWN];
+    unsigned short                  saved_lut;
+    jo_fixed                        scale;
+    jo_fixed                        hx;
+    jo_fixed                        hy;
+    jo_fixed                        cx;
+    jo_fixed                        cy;
+    int                             rect_count;
+    int                             count;
+    int                             light;
+    int                             level;
+    int                             value;
+    int                             texture;
+    int                             size;
+    int                             g;
+    int                             i;
+    int                             j;
+    int                             k;
+    bool                            whole;
+
+    // Fade, the brightest ones (the light seen: intensity x size)
+    count = 0;
+    for (i = 0, glow = __jo_glows; i < JO_3D_GLOW_MAX; ++i, ++glow)
+    {
+        if (!glow->used)
+            continue;
+        value = on_screen[i] && glow->intensity > 0 ? __jo_glow_points_seen[glow->seen_points & 15] : 0;
+        if (glow->fade < value)
+            glow->fade = (short)JO_MIN(glow->fade + JO_GLOW_FADE_STEP, value);
+        else
+            glow->fade = (short)JO_MAX(glow->fade - JO_GLOW_FADE_STEP, value);
+        if (!on_screen[i] || glow->fade <= 0)
+            continue;
+        value = (glow->intensity * glow->fade >> 8) * JO_MAX(JO_MIN(diameter[i] + 2 * JO_MAX(half_w[i], half_h[i]), 512), 4);
+        if (count == JO_3D_GLOW_LAYER_SHOWN && score[count - 1] >= value)
+            continue;
+        for (j = JO_MIN(count, JO_3D_GLOW_LAYER_SHOWN - 1); j > 0 && score[j - 1] < value; --j)
+        {
+            order[j] = order[j - 1];
+            score[j] = score[j - 1];
+        }
+        order[j] = (unsigned char)i;
+        score[j] = value;
+        count = JO_MIN(count + 1, JO_3D_GLOW_LAYER_SHOWN);
+    }
+    if (count == 0 || !jo_3d_transparency_is_running())
+        return;
+    // The rectangles of clip (the glows of another rectangle are not drawn: group -1)
+    rect_count = 0;
+    for (j = 0; j < count; ++j)
+    {
+        i = order[j];
+        for (g = 0; g < rect_count; ++g)
+            if (rects[g].left == rect[i].left && rects[g].top == rect[i].top && rects[g].right == rect[i].right &&
+                rects[g].bottom == rect[i].bottom)
+                break;
+        if (g == rect_count && rect_count < JO_3D_GLOW_LAYER_RECTS)
+            rects[rect_count++] = rect[i];
+        group[j] = (unsigned char)(g < rect_count ? g : 255);
+    }
+    scale = jo_3d_transparency_get_scale();
+    lut = __jo_glow_luts + (__jo_vdp1_frame_tag() % JO_GLOW_STATES) * JO_3D_GLOW_LAYER_SHOWN * 16;
+    jo_3d_transparency_begin();
+    for (g = 0; g < rect_count; ++g)
+    {
+        whole = rects[g].left <= 0 && rects[g].top <= 0 && rects[g].right >= __jo_screen.width - 1 &&
+                rects[g].bottom >= __jo_screen.height - 1;
+        jo_3d_transparency_set_clip(whole ? JO_NULL : &rects[g]);
+        for (j = 0; j < count; ++j)
+        {
+            if (group[j] != g)
+                continue;
+            i = order[j];
+            glow = &__jo_glows[i];
+            light = glow->intensity * glow->fade >> 8;
+            // (smaller than the smallest disc: less light, its area)
+            if (diameter[i] < JO_GLOW_LAYER_MIN_DIAMETER && glow->shape < JO_3D_GLOW_RECT)
+                light = light * diameter[i] * diameter[i] / (JO_GLOW_LAYER_MIN_DIAMETER * JO_GLOW_LAYER_MIN_DIAMETER);
+            if (light <= 0)
+                continue;
+            // Its table: the light of a level (level / levels)^2, like the glows of the VDP2
+            for (k = 1; k <= JO_GLOW_LAYER_LEVELS; ++k)
+            {
+                level = light * k * k;
+                lut[k] = JO_COLOR_RGB(glow->r * level / (256 * JO_GLOW_LAYER_LEVELS * JO_GLOW_LAYER_LEVELS),
+                                      glow->g * level / (256 * JO_GLOW_LAYER_LEVELS * JO_GLOW_LAYER_LEVELS),
+                                      glow->b * level / (256 * JO_GLOW_LAYER_LEVELS * JO_GLOW_LAYER_LEVELS));
+            }
+            // Its quad in the layer (centered coordinates: the middle of the layer is the middle of the screen)
+            cx = jo_fixed_mult(jo_int2fixed(sx[i]), scale);
+            cy = jo_fixed_mult(jo_int2fixed(sy[i]), scale);
+            if (glow->shape >= JO_3D_GLOW_RECT)
+            {
+                // (the texture: the rectangle in its middle half, its light around it)
+                hx = jo_fixed_mult(jo_int2fixed(half_w[i] + JO_MAX(diameter[i] / 2, 2)), scale);
+                hy = jo_fixed_mult(jo_int2fixed(half_h[i] + JO_MAX(diameter[i] / 2, 2)), scale);
+            }
+            else
+                hx = hy = jo_fixed_mult(jo_int2fixed(JO_MAX(diameter[i], JO_GLOW_LAYER_MIN_DIAMETER) / 2), scale);
+            // (a disc: the texture of the nearest size in the layer)
+            size = 0;
+            if (glow->shape < JO_3D_GLOW_RECT)
+                for (k = 1; k < JO_GLOW_LAYER_SIZES; ++k)
+                    if (JO_ABS(jo_int2fixed(__jo_glow_layer_sizes[k]) - 2 * hx) < JO_ABS(jo_int2fixed(__jo_glow_layer_sizes[size]) - 2 * hx))
+                        size = k;
+            corners[0].x = cx - hx; corners[0].y = cy - hy;
+            corners[1].x = cx + hx; corners[1].y = cy - hy;
+            corners[2].x = cx + hx; corners[2].y = cy + hy;
+            corners[3].x = cx - hx; corners[3].y = cy + hy;
+            texture = __jo_glow_layer_textures[glow->shape][size];
+            saved_lut = __jo_sprite_lut[texture];
+            __jo_sprite_lut[texture] = (unsigned short)(((unsigned int)lut - JO_VDP1_VRAM) >> 3);
+            jo_sprite_draw_4p_fixed(texture, corners, depth[i], true);
+            __jo_sprite_lut[texture] = saved_lut;
+            lut += 16;
+        }
+    }
+    jo_3d_transparency_end();
 }
 
 /*
@@ -1088,6 +1532,19 @@ void                                jo_3d_glows_set_rays(const int light, const 
     __jo_glow_diagonal_ray_light = JO_MAX(0, JO_MIN(diagonal_light, 256));
 }
 
+void                                jo_3d_glows_set_mode(const jo_3d_glow_mode mode)
+{
+    bool                            enabled;
+
+    if (mode == __jo_glow_mode)
+        return;
+    enabled = __jo_glows_enabled;
+    jo_3d_glows_enable(false);
+    __jo_glow_mode = mode;
+    if (enabled)
+        jo_3d_glows_enable(true);
+}
+
 bool                                jo_3d_glows_enable(const bool enabled)
 {
     int                             k;
@@ -1098,16 +1555,25 @@ bool                                jo_3d_glows_enable(const bool enabled)
     if (!enabled)
     {
         __jo_glows_enabled = false;
-        __jo_vdp2_glow_layers_hide();
+        if (__jo_glow_mode == JO_3D_GLOW_VDP2)
+            __jo_vdp2_glow_layers_hide();
+        return (true);
+    }
+    if (__jo_glow_mode == JO_3D_GLOW_LAYER)
+    {
+        // (the sprites of the VDP1: no layer of the VDP2)
+        if (!jo_glow_layer_build())
+            return (false);
+        __jo_glows_enabled = true;
         return (true);
     }
     if (!jo_glow_alloc_palettes() || !jo_glow_build_vram())
         return (false);
     for (k = 0; k < JO_GLOW_STATES; ++k)
         __jo_glow_states[k].tag = ~0u;
-    // Nothing displayed until the first frame of the glows
-    for (k = 0; k < JO_GLOW_MAP_WIDTH * JO_GLOW_MAP_WIDTH; ++k)
-        __jo_glow_map[k] = __jo_glow_empty_char;
+    // Nothing displayed until the first frame of the glows (the cells written, not the whole map: 4096 writes in the VRAM
+    // of the VDP2 wait for its free cycles while the screens are displayed, 0.4 s at the start of a race)
+    jo_glow_clear_displayed(__jo_glow_map);
     __jo_glow_displayed.count = 0;
     __jo_glow_displayed.overlap_count = 0;
     for (k = 0; k < JO_GLOW_SHOWN; ++k)
@@ -1306,6 +1772,7 @@ void                                jo_3d_glows_draw(const jo_pos3D_fixed * cons
     short                           half_h[JO_3D_GLOW_MAX];
     int                             score[JO_3D_GLOW_MAX];
     bool                            on_screen[JO_3D_GLOW_MAX];
+    jo_fixed                        depth[JO_3D_GLOW_MAX];
     jo_3d_rect                      rect[JO_3D_GLOW_MAX];
     unsigned char                   order[JO_GLOW_SHOWN];
     int                             light[JO_GLOW_SHOWN];
@@ -1349,6 +1816,7 @@ void                                jo_3d_glows_draw(const jo_pos3D_fixed * cons
         v.z = jo_fixed_dot((const jo_fixed *)&glow->position, columns[2]) + m[3][2];
         if (v.z <= JO_FIXED_16)
             continue;
+        depth[i] = v.z;
         k = jo_fixed_div(jo_3d_get_projection_distance(), v.z);
         sx[i] = (short)jo_fixed2int(jo_fixed_mult(v.x, k));
         sy[i] = (short)jo_fixed2int(jo_fixed_mult(v.y, k));
@@ -1400,6 +1868,22 @@ void                                jo_3d_glows_draw(const jo_pos3D_fixed * cons
             jo_glow_test(&__jo_glows[__jo_glow_ray_cursor], camera);
             ++rays;
         }
+    }
+    if (__jo_glow_mode == JO_3D_GLOW_LAYER)
+    {
+        // (its sprites freed with the sprites of a level: added again, only by the master CPU outside of an interrupt)
+        if (__jo_glow_luts == JO_NULL)
+        {
+            if (__jo_core_on_slave_cpu() || (__jo_core_get_sr() & JO_SH2_SR_INTERRUPT_MASK) != 0)
+                return;
+            if (!jo_glow_layer_build())
+            {
+                __jo_glows_enabled = false;
+                return;
+            }
+        }
+        jo_glow_layer_draw(sx, sy, diameter, half_w, half_h, depth, rect, on_screen);
+        return;
     }
     // Fade, score (the light seen: intensity x size), the brightest ones (JO_GLOW_SHOWN at most)
     count = 0;

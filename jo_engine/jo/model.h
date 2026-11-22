@@ -71,6 +71,18 @@
  *                                                                            (at offset from the count): key_count x
  *                                                                            (fixed root x, y, z, then bones x
  *                                                                            (s16 angle x, y, z), + s16 pad if odd)
+ *    "MRPH"  u32 count, u16 shift, u16 flags, then count x jo_3d_morph         Vertex animations (morph targets): the
+ *            (28 bytes), then the frames                                     points of each frame. The frames of an
+ *                                                                            animation (at offset from the count):
+ *                                                                            frame_count x (points x (s16 x, y, z) of
+ *                                                                            the points: value x 2^shift = 16.16 fixed;
+ *                                                                            then, with the flag 1, polygons x u8:
+ *                                                                            the normal of each polygon, an index in
+ *                                                                            jo_3d_morph_normal(); 4 bytes aligned)
+ *    "SKIN"  u32 count, then count x jo_3d_skin_point (8 bytes)                The points of a skeleton that follow 2
+ *                                                                            bones (a skin that bends at the joints):
+ *                                                                            the bone of their group and another one,
+ *                                                                            weighted (see jo_3d_model_draw_pose())
  *    "END "  0
  *  @endcode
  */
@@ -116,6 +128,9 @@
 /** @brief Material: only the polygons that cross the near plane are drawn in parts (jo_3d_set_texture_subdivision_near_only(),
  *  MTL: jo_subdivision 2) */
 # define JO_3D_MATERIAL_SUBDIVISION_NEAR        (1 << 12)
+/** @brief Material: the VDP1 reads every other texel of a texture drawn smaller than it is (JO_VDP1_HIGH_SPEED_SHRINK,
+ *  MTL: jo_high_speed_shrink 1; all the textures: jo_3d_set_high_speed_shrink()) */
+# define JO_3D_MATERIAL_HIGH_SPEED_SHRINK       (1 << 13)
 /** @brief First flag of the program (bits 16 to 31, MTL: jo_user) */
 # define JO_3D_MATERIAL_USER(N)                 (1 << (16 + (N)))
 
@@ -174,6 +189,38 @@ typedef struct
     unsigned int                            offset;         // Keys: offset from the count of the "ANIM" chunk
 }                                           jo_3d_animation;
 
+/** @brief jo_3d_morph.flags: the last frame goes back to the first one */
+# define JO_3D_MORPH_LOOP                       (1 << 0)
+/** @brief Directions of the normals of the vertex animations (see jo_3d_morph_normal()) */
+# define JO_3D_MORPH_NORMALS                    (256)
+
+/** @brief Vertex animation (morph targets: the position of each point at each frame, the same layout as the file: 28
+ *  bytes). Unlike a skeleton, the surface bends (a knee, a cloth, a face): see jo_3d_model_draw_morph() */
+typedef struct
+{
+    char                                    name[16];
+    unsigned short                          frame_count;
+    unsigned short                          frame_ticks;    // Time between 2 frames (1/60 s)
+    unsigned short                          flags;          // JO_3D_MORPH_xxx
+    unsigned short                          duplicate;      // 0 in the file. Set at the loading: 1 when a vertex animation
+                                                            // before has the same name
+    unsigned int                            offset;         // Frames: offset from the count of the "MRPH" chunk
+}                                           jo_3d_morph;
+
+/** @brief jo_3d_skin_point.weight: 1.0 */
+# define JO_3D_SKIN_ONE                         (32768)
+
+/** @brief A point of a skeleton that follows 2 bones (the same layout as the file: 8 bytes): drawn by the bone of its
+ *  group, moved toward where the other bone puts it (the knee between the thigh and the shin) */
+typedef struct
+{
+    unsigned short                          point;          // Index of the point
+    unsigned char                           bone;           // The bone of its group (the bone that draws it)
+    unsigned char                           other;          // The other bone (its parent or a child)
+    unsigned short                          weight;         // Weight of the other bone (JO_3D_SKIN_ONE: 1.0)
+    unsigned short                          reserved;       // 0
+}                                           jo_3d_skin_point;
+
 /** @brief Pose of a skeleton: the angles of the bones (see jo_3d_model_get_pose() and jo_3d_model_draw_pose()) */
 typedef struct
 {
@@ -216,6 +263,20 @@ typedef struct
     unsigned int                            animation_count;
     jo_3d_animation                         *animations;
     const unsigned char                     *animation_data;    // The "ANIM" chunk from its count
+    unsigned int                            morph_count;        // Vertex animations (0: none)
+    jo_3d_morph                             *morphs;
+    const unsigned char                     *morph_data;        // The "MRPH" chunk from its count
+    unsigned int                            morph_frame_size;   // Bytes of a frame
+    unsigned short                          morph_shift;        // A value of a frame x 2^shift: 16.16 fixed
+    bool                                    morph_normals;      // The frames have the normals of the polygons
+    jo_3d_polygon_data                      *morph_draw[2];     // What jo_3d_model_draw_morph() draws, for the master CPU
+                                                                // and the slave CPU (one block each: the points
+                                                                // interpolated; the polygons with the normals of the frame
+                                                                // if some are lit, else the ones of the model; the
+                                                                // attributes of the model), and jo_3d_model_draw_pose()
+                                                                // with a skin (its points moved by 2 bones)
+    unsigned int                            skin_count;         // Points that follow 2 bones (0: a rigid skeleton)
+    const jo_3d_skin_point                  *skin;
     void                                    *file;              // Data of the file (jo_3d_load_model(): the points, the
                                                                 // polygons, etc are in it), JO_NULL: copies
     bool                                    file_not_owned;     // The data of the file belong to the caller
@@ -294,7 +355,7 @@ bool                                        jo_3d_model_set_environment(jo_3d_mo
 # define JO_3D_MODEL_POOL_MAX_BLOCKS            (256)
 
 /** @brief Models read one after the other from a file (the parts of a level) into big memory blocks, used in place
- *  (jo_3d_create_model_in_place()): no copy, no small memory blocks for each model. Measured (rally demo, about 1000
+ *  (jo_3d_create_model_in_place()): no copy, no small memory blocks for each model. Measured (a 3D game, about 1000
  *  models): the copies of jo_3d_create_model_from_memory() took 11 s (about 12 memory blocks each, every block allocated
  *  after a search among the ones before)
  */
@@ -354,14 +415,31 @@ jo_3d_model                                 *jo_3d_load_model(const char * const
  */
 void                                        jo_3d_set_unique_gouraud_tables(const bool unique);
 
-/** @brief The next models created or loaded draw without gouraud the polygons whose 4 gouraud colors leave the
- *  texels as they are (16, 16, 16 each): the same picture (default: off)
- *  @param skipped true: those polygons without gouraud
- *  @remarks Mednafen emulates a pixel with gouraud slower than one without (the gouraud of every polygon of a split
- *  screen: 6 % of its time). Not for a model whose tables the game writes again (a light, a tint): those polygons have
- *  no table any more. Not with jo_3d_set_unique_gouraud_tables()
+/** @brief The next models created or loaded draw without gouraud only the polygons whose 4 gouraud colors leave the
+ *  texels as they are (16, 16, 16 each): the same picture (see jo_3d_set_uniform_gouraud_skipped(), on by default, that
+ *  does it too)
+ *  @param skipped true: only those polygons without gouraud; false: all the polygons keep their gouraud table
+ *  @remarks Not for a model whose tables the game writes again (a light, a tint): those polygons have no table any more.
+ *  Not with jo_3d_set_unique_gouraud_tables()
  */
 void                                        jo_3d_set_neutral_gouraud_skipped(const bool skipped);
+
+/** @brief The next models created or loaded draw without gouraud the polygons whose 4 gouraud colors are the same (a
+ *  flat light), the light put in their color: the same picture, the VDP1 draws them faster (default: on)
+ *  @param skipped true: those polygons without gouraud (the neutral ones too, see jo_3d_set_neutral_gouraud_skipped());
+ *  false: all the polygons keep their gouraud table (the models that the game tints or lights by their tables, see
+ *  below). Both: the copies of the color lookup tables made until then are not shared with the next models any more
+ *  @remarks An untextured polygon: its RGB color + the light. A texture of 16 colors (color lookup table): a copy of
+ *  the table with the light (32 bytes of the VRAM with the gouraud tables of the model, shared by the next models until
+ *  sprites are freed or until this function is called). The other textures (RGB, palette) and the lit polygons
+ *  (JO_3D_MATERIAL_LIGHT) keep their gouraud, the models of the entities (a tint) and of the cells (the point lights)
+ *  too
+ *  @remarks Load between jo_3d_set_uniform_gouraud_skipped(false) and (true) a model that the game tints
+ *  (jo_3d_set_tint()), adds to the point lights (jo_3d_point_lights_add_mesh()), whose gouraud tables or polygon colors
+ *  it writes again: the polygons without gouraud would not get the tint or the light, a color changed would lose the
+ *  light put in it. Not with jo_3d_set_unique_gouraud_tables() (those models keep all their tables)
+ */
+void                                        jo_3d_set_uniform_gouraud_skipped(const bool skipped);
 
 /** @brief Get the sprite id of a texture of the models (loaded the first time: a texture shared by several models,
  *         or by the program, is loaded once)
@@ -453,6 +531,9 @@ void                                        jo_3d_pose_blend(const jo_3d_model *
  *  @param pose Pose (JO_NULL: the pose of the OBJ)
  *  @param callback Called after each bone is drawn, with the matrix of the bone (JO_NULL: none)
  *  @param param Parameter of the callback
+ *  @remarks With a skin ("SKIN", jo_model.py by default when polygons join 2 bones): the points near a joint follow both
+ *           bones (computed for each draw in a buffer of the model, see model->morph_draw), the skin bends instead of
+ *           folding like rigid parts
  */
 void                                        jo_3d_model_draw_pose(const jo_3d_model * const model, const jo_3d_pose * const pose,
                                                                   const jo_3d_bone_callback callback, void * const param);
@@ -476,6 +557,52 @@ void                                        jo_3d_slave_model_draw_pose(const jo
  */
 void                                        jo_3d_model_set_hidden_bones(const unsigned int mask);
 
+/** @brief Find a vertex animation of a model
+ *  @param model Model
+ *  @param name Name of the vertex animation (case insensitive)
+ *  @return Index of the vertex animation, -1 if not found
+ */
+int                                         jo_3d_model_find_morph(const jo_3d_model * const model, const char * const name);
+
+/** @brief Duration of a vertex animation
+ *  @param model Model
+ *  @param morph Index of the vertex animation
+ *  @return Ticks (1/60 s): a loop goes back to its first frame at this time, the other ones stay on their last frame
+ */
+int                                         jo_3d_model_morph_duration(const jo_3d_model * const model, const int morph);
+
+/** @brief Draw a model with the current matrix, its points at a time of a vertex animation (the 2 frames around it are
+ *  interpolated)
+ *  @param model Model
+ *  @param morph Index of the vertex animation (see jo_3d_model_find_morph()), -1 or wrong: the points of the OBJ
+ *  @param time Ticks (1/60 s) from the start of the animation
+ *  @remarks The points are interpolated in a buffer of the model, not in the model: several characters drawn with the same
+ *           model at different times. Cost: 3 multiplications per point, beside their transformation
+ *  @remarks The lit polygons (jo_light in the MTL, see jo_3d_light()) get the normal of the nearest frame (one of 256
+ *           directions). The point lights (jo_3d_point_lights_xxx) and the corner normals ("CNRM") are not animated
+ *  @remarks Drawn with the polygon data of the model for this CPU (model->morph_draw): the tint (jo_3d_set_tint()) is
+ *           applied, the environment map of the mesh (jo_3d_model_set_environment()) is not
+ */
+void                                        jo_3d_model_draw_morph(const jo_3d_model * const model, const int morph, const int time);
+
+/** @brief jo_3d_model_draw_morph() on the slave CPU (call it on the slave CPU: its own buffer, the master CPU can draw the
+ *  same model at the same time)
+ *  @param model Model
+ *  @param morph Index of the vertex animation
+ *  @param time Ticks (1/60 s) from the start of the animation
+ *  @return false if the slave CPU can't draw more commands in this frame (see jo_3d_slave_mesh_draw())
+ *  @remarks The tint of the slave CPU (jo_3d_slave_set_tint()) is not applied (its copies of the gouraud tables are the
+ *           ones the master CPU prepared for the meshes it drew)
+ */
+bool                                        jo_3d_slave_model_draw_morph(const jo_3d_model * const model, const int morph, const int time);
+
+/** @brief Direction of a normal of the vertex animations (the frames give the normal of each polygon as one byte)
+ *  @param index 0 to JO_3D_MORPH_NORMALS - 1 (directions spread evenly on the sphere: a golden angle spiral, the same as
+ *         jo_model.py)
+ *  @param normal Unit vector (16.16 fixed)
+ */
+void                                        jo_3d_morph_normal(const int index, jo_pos3D_fixed * const normal);
+
 /** @brief Move what the drawing of a model reads for each vertex, polygon and bone (its points, its polygons, their
  *  attributes, its bones and their groups) to the high work RAM, when it is in a slower memory (the low work RAM, a RAM
  *  cartridge)
@@ -498,6 +625,13 @@ bool                                        jo_3d_model_use_fast_memory(jo_3d_mo
  */
 static  __jo_force_inline void              jo_3d_model_draw(const jo_3d_model * const model)
 {
+#ifdef JO_DEBUG
+    if (model == JO_NULL)
+    {
+        jo_core_error("model is null");
+        return;
+    }
+#endif
     if (model->bone_count > 0)
         jo_3d_model_draw_pose(model, JO_NULL, JO_NULL, JO_NULL);
     else

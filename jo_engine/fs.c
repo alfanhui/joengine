@@ -468,7 +468,10 @@ static int                      jo_cd_get_sectors(const unsigned int n, unsigned
             else
             {
                 for (JO_ZERO(b); b < bytes; ++b)
-                    buf[b] = value >> (24 - JO_MULT_BY_8(b));
+                {
+                    buf[b] = value >> 24;
+                    value <<= 8;
+                }
                 buf += bytes;
                 JO_ZERO(bytes);
             }
@@ -1554,6 +1557,7 @@ void                    jo_fs_get_read_stats(unsigned int * const vblanks, unsig
     }
 }
 
+JO_LOW_WORK_RAM_CODE
 char                    *jo_fs_read_file_ptr(const char *const filename, void *buf, int *len)
 {
     int			        fid;
@@ -1685,6 +1689,7 @@ char*					jo_fs_read_file_in_dir(const char *const filename, const char *const s
     return stream;
 }
 
+JO_LOW_WORK_RAM_CODE
 bool                    jo_fs_open(jo_file * const file, const char *const filename)
 {
 #ifdef JO_DEBUG
@@ -1719,7 +1724,8 @@ bool                    jo_fs_open(jo_file * const file, const char *const filen
  */
 static bool             jo_fs_fill_read_buffer(jo_file * const file)
 {
-    if (!jo_fs_read_sectors_to(file, file->read_buffer, file->read_buffer_size / JO_SECTOR_SIZE))
+    // (an unsigned division: a shift. The signed one called a routine of libgcc, linked by every program that reads files)
+    if (!jo_fs_read_sectors_to(file, file->read_buffer, (int)((unsigned int)file->read_buffer_size / JO_SECTOR_SIZE)))
         return (false);
     JO_ZERO(file->read_index);
     return (true);
@@ -1774,7 +1780,7 @@ bool                    jo_fs_seek_forward(jo_file * const file, unsigned int nb
     file->read_index = file->read_buffer_size;
     // Skip the whole buffers without reading them
     buffers = nbytes / file->read_buffer_size;
-    if (buffers > 0 && !__jo_fs_seek_sector(file->handle, ((jo_fs_handle *)file->handle)->position + buffers * (file->read_buffer_size / JO_SECTOR_SIZE)))
+    if (buffers > 0 && !__jo_fs_seek_sector(file->handle, ((jo_fs_handle *)file->handle)->position + buffers * (int)((unsigned int)file->read_buffer_size / JO_SECTOR_SIZE)))
     {
 #ifdef JO_DEBUG
         jo_core_error("Seek failed");
@@ -1816,6 +1822,75 @@ int                     jo_fs_read_next_bytes(jo_file * const file, char *buffer
     return (jo_fs_read_raw(file, buffer, nbytes, &file->read, file->size));
 }
 
+int                     jo_fs_read_available(jo_file * const file, void * const buffer, unsigned int nbytes)
+{
+    char                *out;
+    int                 done;
+    int                 got;
+    unsigned int        n;
+
+#ifdef JO_DEBUG
+    if (file == JO_NULL)
+    {
+        jo_core_error("file is null");
+        return (-1);
+    }
+    if (buffer == JO_NULL)
+    {
+        jo_core_error("buffer is null");
+        return (-1);
+    }
+#endif
+    // (a compressed file: its bytes come from the decompression, not from the sectors)
+    if (file->lz != JO_NULL)
+        return (-1);
+    out = (char *)buffer;
+    JO_ZERO(done);
+    while (nbytes > 0 && file->read < file->size)
+    {
+        // The bytes left in the read buffer
+        if (file->read_index < file->read_buffer_size)
+        {
+            n = (unsigned int)(file->read_buffer_size - file->read_index);
+            if (n > nbytes)
+                n = nbytes;
+            if (n > (unsigned int)(file->size - file->read))
+                n = (unsigned int)(file->size - file->read);
+            jo_memcpy(out, file->read_buffer + file->read_index, n);
+            file->read_index += (int)n;
+            file->read += (int)n;
+            out += n;
+            nbytes -= n;
+            done += (int)n;
+            continue;
+        }
+        // The whole sectors wanted that the drive has read: straight to the output (the DMA when it is aligned)
+        n = JO_MIN(nbytes, (unsigned int)(file->size - file->read)) / JO_SECTOR_SIZE;
+        if (n > 0)
+        {
+            if ((got = __jo_fs_take_sectors((jo_fs_handle *)file->handle, (int)n, out, (int)(n * JO_SECTOR_SIZE))) < 0)
+                return (-1);
+            if (got == 0)
+                break;
+            file->read += got;
+            out += got;
+            nbytes -= (unsigned int)got;
+            done += got;
+            continue;
+        }
+        // Less than a sector wanted: the next sector at the end of the read buffer (the bytes after the end of the file
+        // are never copied: file->size)
+        if ((got = __jo_fs_take_sectors((jo_fs_handle *)file->handle, 1, file->read_buffer + file->read_buffer_size - JO_SECTOR_SIZE,
+                                        JO_SECTOR_SIZE)) < 0)
+            return (-1);
+        if (got == 0)
+            break;
+        file->read_index = file->read_buffer_size - JO_SECTOR_SIZE;
+    }
+    return (done);
+}
+
+JO_LOW_WORK_RAM_CODE
 void                    jo_fs_close(jo_file * const file)
 {
 #ifdef JO_DEBUG

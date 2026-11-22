@@ -81,6 +81,8 @@ typedef enum
  *  @param n Segment size
  *  @param behaviour Allocation Behaviour
  *  @return a pointer to the allocated memory or NULL if failed
+ *  @warning On the master CPU only, not in an interrupt (a VBLANK callback): the blocks are not shared (checked with
+ *  JO_DEBUG, as jo_free())
  */
 void	        *jo_malloc_with_behaviour(unsigned int n, const jo_malloc_behaviour behaviour);
 
@@ -95,7 +97,8 @@ static  __jo_force_inline void	*jo_malloc(unsigned int n)
 }
 
 /** @brief function frees the memory space pointed to by p
- *  @param p pointer that must have been returned by a previous call to jo_malloc()
+ *  @param p pointer that must have been returned by a previous call to jo_malloc() (JO_NULL: nothing is freed, an error with
+ *  JO_DEBUG)
  */
 void	        jo_free(const void * const p);
 
@@ -108,6 +111,8 @@ void            jo_reduce_memory_fragmentation(void);
  *  @param ptr Pointer to the beginning of the memory segment
  *  @param size_in_bytes Size of the memory segment in bytes
  *  @remarks See also JO_MALLOC_MAX_MEMORY_ZONE
+ *  @remarks A zone in the low work RAM starts after the functions of the engine there (JO_LOW_WORK_RAM_FREE, see
+ *  JO_LOW_WORK_RAM_CODE): jo_add_memory_zone(JO_WORK_RAM_LOW, size) gives what is free after them
  */
 void            jo_add_memory_zone(unsigned char *ptr, const unsigned int size_in_bytes);
 

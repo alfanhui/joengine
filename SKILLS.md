@@ -1,9 +1,104 @@
 # SKILLS: what Claude has learned working on CircuitBreaker
 
-Read this at the start of a session (CLAUDE.md points here). Add to it whenever something costs
-time to find out: a hardware fact, a tool quirk, a mistake not to repeat. Keep each entry short
-and say *why*. The game lives in `Projects/circuit-breaker` (its own git repo); this file and
-CLAUDE.md sit in the jo-engine checkout around it.
+Read **Start here** at the start of a session (CLAUDE.md points here); the rest when a task touches
+it (the map at the end of Start here). Add to it whenever something costs time to find out: a
+hardware fact, a tool quirk, a mistake not to repeat. Keep each entry short and say *why*. Put a
+new graphics lesson in the triage table too, not only further down. The game lives in
+`Projects/circuit-breaker` (its own git repo); this file and CLAUDE.md sit in the jo-engine
+checkout around it.
+
+# Start here
+
+## Two guides: jo's and ours
+
+- **jo's own** (since 2026-11-18, merged from upstream): `AGENTS.md` (loaded by CLAUDE.md) and the
+  skill `.claude/skills/jo-engine/` (`SKILL.md`; `references/performance.md`, `3d.md`,
+  `diagnose.md`, `assets.md`, `porting.md`). The engine's general rules and its API: search
+  `Documentation/api_index.md` before writing a helper.
+- **This file**: what's particular to CircuitBreaker (a city of 256 towers drawn by hand, not jo's
+  models; two CPUs; films), and what we measured. Where they disagree, the table below says which
+  holds here and why.
+
+## Where jo's skill and ours meet
+
+| Topic | jo says | Here | So |
+|---|---|---|---|
+| float, division, variable shifts | none in a frame | the same rule (CLAUDE.md) | agree. jo adds two we broke: **a signed `>>` by a constant other than 1, 2, 8 or 16 is a routine call** (`__ashiftrt_r4_N`, a bit at a time), and **`x << n` with n variable** is one too. `python tools/slow_calls.py Projects/circuit-breaker/game.elf` lists every function that calls one: on 2026-11-18 `grey_boxes_add`, `grey_side_add`, `frustum_now`, the walker and `drone_draw` all did (`>> 10`, `>> 8`, variable shifts, `__sdivsi3`). Run it after touching a per-frame path |
+| The divider unit | `jo_fixed_div_start()` + `jo_fixed_div_result()`: divides while the CPU works | not used yet | where a division must stay per object (the landmarks, the frustum), use it |
+| One mesh per object | `jo_3d_mesh_draw()`, not quads one by one | the same: `level_mesh` | agree |
+| VDP1 time is pixels walked, off-screen too | small polygons, cut big near faces | the same (guard band, trims, floor_hides) | agree; ours measured ~350k px a frame (docs/LEVELS.md) |
+| The command table has a size | `JO_VDP1_MAX_COMMANDS`: too many polygons lose **the last ones** | not watched | the last are the **nearest** (sent far to near): "the roof ahead is missing" can be this too, not only VDP1 out of time. Read `cmd` on the readout against it |
+| Half transparency | never on big surfaces: screen doors | the same (the beam, the glass) | agree |
+| Double-sided faces | avoid (`JO_3D_DUAL_PLANE`) | the grey boxes and city are dual-plane | **ours, deliberately**: we only add faces that face the eye (grey_boxes_add's tests), and the CPU's cut can turn a polygon's corner order; jo's rule is for models culled by jo |
+| Far scenery | a VDP2 image, not far 3D | the skyline ring is VDP1 strips | **ours, deliberately**: it must slide as you move (parallax), which a VDP2 layer can't (level.c) |
+| `JO_FRAMERATE_DYNAMIC` | "as soon as a frame is ready" | tried (SG-2): slower, not taken | ours: `JO_FRAMERATE = 1` |
+| LOD by distance on the ground | not by depth in the view | the same (`level_reach`) | agree |
+| `jo_3d_set_depth_bias()` | puts a whole model in front of or behind another | not used: we chain with `JO_3D_SORT_PREVIOUS` | worth trying where a SORT_PREVIOUS chain's anchor goes wrong |
+| Low Work RAM | jo can put rarely used code there (`JO_COMPILE_WITH_LOW_WORK_RAM_CODE`) | main.c gives all of it to `jo_malloc` | off here; if it's ever on, start our zone at `JO_LOW_WORK_RAM_FREE` |
+| `jo_printf` | ~2 000 cycles a line | the debug readout prints ~10 lines a frame | ~4% of a frame in every film: compare builds with the same readout on |
+| Look at the data | a save state's VDP1 command table shows which polygon a glitch is (`tools/savestate.sh`, `tools/vdp1_commands.py`) | we've only read screenshots | try it on the next glitch a film can't explain |
+
+## Graphics glitch triage
+
+Find the symptom, check the causes in order, confirm before changing anything. Most of these have
+bitten us more than once.
+
+| What's seen | Likely causes, most likely first | Confirm with | Where it's handled |
+|---|---|---|---|
+| The **nearest** polygons missing: the roof ahead or underfoot cut off, often in a wedge; a floor "not drawn" | 1. VDP1 didn't finish the frame: too many pixels, **or the CPU ran late** (with `JO_FRAMERATE = 1` a late list leaves VDP1 too little time). 2. The command table full (`JO_VDP1_MAX_COMMANDS`). 3. Our own mesh full (`GREY_QUADS_MAX`...: drops the furthest, as groups go nearest first) | readout `vdp1 over` (any count is this), `cpu`, `cmd`; a profiler build's `px`. **The hole check can't see it** (VDP2 shows, not magenta) | `game/draw_budget.h`, the seen tables (`city_seen`, streets), `floor_hides`, SG-9 (`screen_wall`), the walker's frame roofs; and cutting CPU (`slow_calls.py`) |
+| **Magenta** in a `GLITCH_CHECK` build | nothing drawn there: a culling rule too eager (a seen table, the skyline's hiders, floor_hides, a trim) | `holes_from` / `holes_to` in a film; switch the rule off (features.h) and film again | the rule's own unit test against lines of sight |
+| **VDP2's sky or board** where a wall should be | 1. the wall nearer than the near plane, so not drawn, and something relied on it (SG-9 took a wall 1 from the eye). 2. an unfinished frame (row 1) | the readout's `sw`; `vdp1 over` | `screen_wall.h`: every corner's hit >= `SCREEN_WALL_NEAREST` |
+| Something **far drawn over something near** (a landmark over the skyline, the floor over boxes, a wall over boxes against it) | painter's sort, one depth a polygon: a big face sorts by its middle; a `SORT_PREVIOUS` chain whose first polygon wasn't drawn; something placed nearer than what should hide it | wireframe (pause menu) to see the layers; which sort each uses | cut big faces; `SORT_MAX` for what goes behind, `SORT_MIN` in front; push it really behind (`landmark_behind_ring`); depth bias |
+| Things **popping** in and out as you turn or move | the draw budget leaving landmarks out (`bg` > 0); full fog leaving blocks out; a LOD threshold (`GREY_LID_REACH`, `GREY_TOPS_REACH`); a mesh full; a textured strip dropped whole near the guard band; a landmark easing in view | the readout's `bg`, `poly`; a turning film, a shot every quarter second | a pop is a threshold: move it out of sight (fog), ease it, or draw the cheaper form at the same place |
+| A **one-frame flash** or stray colour | a table VDP1 reads changed while it draws (fog Gouraud tables: `FOG_LEAD`); VDP1 and VDP2 a frame apart (fixed by jo, #111); two coplanar faces | `flashes_to` in a film; two shots close in time | double-buffer what VDP1 reads; one face, not two |
+| **Garbled** frame, spikes, stray diagonals | a coordinate past jo's 16.16 range (+-32 767) or VDP1's 11-bit screen range; a twisted quad; a quad made a triangle with its first three corners not distinct | the world positions involved (probe them on the readout) | clamp (`LANDMARK_WORLD_LIMIT`), cut to a box round the view |
+| A **wedge cut out of a side** | a per-end rule (floor_hides) applied to a line that crosses the side's foot | compare with the rule off | take a line only if it's above the side's own foot at both ends (`floor_hides_line`) |
+| A **texture squeezed** into a strip, bands of lines | a textured quad cut by the CPU: VDP1 maps the whole texture onto what's left | which face | textured faces whole or not at all; cut in the model |
+| Hidden things **still drawn** (the wireframe shows them) | an occlusion rule that skips a case (trails crossing: fixed 2026-11-18) | wireframe, and a unit test against lines of sight | the rule; never hide without a sight-line test |
+| **Every shot black** | BSS past the end of memory, or a crash at boot | `game.map`'s `_end` against `__jo_work_end`; a `JO_DEBUG` error screen | |
+
+## Before calling a graphics change done
+
+1. Unit tests (`tests\run_tests.bat`), and for a culling rule a test against lines of sight.
+2. Build: no new warnings; `slow_calls.py` lists none of the functions you touched (or say why).
+3. A film where it acts: **turning**, a shot every quarter second, all the way round, at each
+   place it changes (and from high up and in the streets if it's the city). A `GLITCH_CHECK`
+   film with `holes_from`/`holes_to` if anything's left out.
+4. Read the readout in the shots: `vdp1 over`, `cpu`, `bg`, `sw`, `poly`, `cmd`. A switch in
+   features.h to film with and without it (A/B), twice when watchdogs are about (they make runs
+   differ by 3 to 11 missed frames).
+5. The bench (`bench.steps`) if a per-frame path changed.
+6. Look at every shot where the new path is on (the readout says when), not only the sheet.
+
+## The debug readout, row by row
+
+| Row | Shows |
+|---|---|
+| 0 | `fps`, `cpu` (average % of a frame), `pk` (worst frame: 200% is any frame of two vblanks), `late` frames |
+| 1 | `poly` jo's polygon count / those displayed, `vert`, bots, trails |
+| 2-4 | the player (or `CAM`), speed, arena size, the bot |
+| 5 | parts' worst % of a frame: `ar` arena/pyramid, `co` corridor walls, `sd` city boxes (grey_boxes_add), `tp` all of draw_corridor_boxes (the boxes, on foot the walls), `fl` floor, `gr` grid, `bd` bands, `wk` walker incl. drones, `mi` mirror |
+| 6 | `vdp1 over` (this second / since boot), `busy`, `cmd` (commands), VDP1 version |
+| 7 | `dr` drone flying, `dm` model, `ds` beam; `bg` parts the draw budget dropped; `at` the page you stand on |
+| 8 | the slave's `mwait`/`sidle`; `wd` each watchdog's mood (P patrol, C chase, S search, R returning) and how long it's held you |
+| 9 | profiler builds only: `px` pixels by part (S slave, w world, k sky...), worst frame of the second |
+| 10 | `sw`: SG-9's covering wall depth, `-` when none |
+
+## Map of the rest of this file
+
+- **Working with the user**: how we work together.
+- **Building and testing (Windows)**: builds, unit tests, films, E2E harness quirks, glitch checks.
+- **Editing files here**: tool quirks.
+- **Saturn / SGL / jo facts that cost time**: hardware and engine facts, mostly still true; entries
+  marked SGL or dated before 2026-11-08 describe SGL, which jo-engine 2026 replaced (check the code
+  before relying on one).
+- **SEGA's VDP1/VDP2, SCU and dual CPU manuals**: the hardware as designed.
+- **Look and feel decisions so far**: the game's choices and the measurements behind them,
+  in the order they were made.
+- **Other people's Saturn work**: what others measured.
+- **Reference projects in this repo**.
+
+# The rest
 
 ## Working with the user
 
@@ -121,6 +216,129 @@ CLAUDE.md sit in the jo-engine checkout around it.
   Check it with the budget forced on (`budget.dropped = BUDGET_PARTS` for one build).
 - **Films can boot on the hub**: `boot_at hub` (BOOT_AT_HUB). `boot_at 0010` stands you on the
   lift's pad, and the lift takes you up at once.
+- **Low Work RAM (2026-11-16): the city is 16 x 16 now.** `boot_at` codes stay row << 8 |
+  column << 4 (`0800` the entry, `0EA0` the CD block's hub, `0880` the middle). The debug line shows
+  the page (`at 0028_0000`). The table comes from `tools/ram_banks_plan.py --quick --c`. After any
+  change to it, run `python tools/make_city_seen.py` (numpy, ~1.5 min). Its test checks every
+  seventh roof, since all 256 would be minutes.
+- **The plan's pictures for a phone:** `python tools/ram_banks_plan.py --png` (headless Edge, a
+  profile folder each: one Edge still closing holds its own, and the next picture comes out empty).
+- **A tool to plan a level before it's built:** `tools/ram_banks_plan.py` checks reach, every move
+  both ways, the routes' shape, and sight. Sight by one hider at a time (the game's table rule
+  today) differs hugely from the walls together (sight lines): 150 against 32. A maze's walls only
+  hide as a whole.
+- **A sure table where the walls hide together** (`make_city_seen.py`, 2026-11-16):
+  - **From a point:** a tower is hidden if the angles it covers are all covered by hiders that are
+    wholly nearer and higher in the view.
+  - **From a patch:** occluder shrinking (Wonka et al. 2000). Shrink the hiders by ε and sample
+    points every ε√2.
+  - **Check it against sight lines:** the tool and the C test both cast lines from random eyes.
+
+  The shrink is the price: it widens every street's slit. 3 x 3 points with ε 89 left 115 seen;
+  7 x 7 with 30 left 77, against ~45 really seen. Measure before tuning: the old table's film
+  showed 64 polygons at 119% CPU, so the cost was per tower, not per polygon, and a smaller table
+  hardly moved the benchmark.
+- **The streets have seen tables too** (2026-11-18, `city_seen_street`, `city_street_under`).
+  Off a roof the game had no table, and a street jump drew every tower to the ground. The pieces
+  are 250 along a street and its full width across, with each crossing whole: 497 pieces, 16.9 KB,
+  a median of 79 towers seen. The eye over a piece is a jump over the highest roof beside it that
+  you can stand on, because a lower eye sees no more. To find every piece with no eye limit, ask
+  `city_street_under(..., CITY_STREET_NO_EYE)`. What's left mid-jump (508k px) is really seen: the
+  tall guard pages either side of the street.
+- **The profiler's px row:** S is the slave's part (the city's floor and boxes), w the master's
+  world. Each is the worst frame of the last second, so two shots in a row repeat the figure: it
+  isn't the frame in the shot. Grepping a build's output for "error" matches `-Werror` in the flags.
+- **"vdp1 over" isn't only pixels** (2026-11-18). With `JO_FRAMERATE=1` the screen swaps at every
+  vblank. A CPU that hands over its list late leaves VDP1 too little time, and the frame shows
+  unfinished. On foot in the city the CPU is ~100-110% even stood on a roof. Look at cpu before
+  px: 583k px on a roof missed nothing, 508k mid-jump at 120% CPU missed 6.
+- **`pk 200%`** only means some frame took two vblanks: any late frame. It's not a spike.
+- **To time a piece of a function:** borrow a readout slot that reads 0 in that place. In the city
+  that's `mi` (the mirror), `bd` (bands) and `dm` (the drone model). Use `perf_part_add(PERF_MIRROR,
+  frc)` round the piece and mark each line `// PROBE` so they all come out together. The boxes
+  (`sd` ~57%) split as: hiders 11-13, `skyline_trim` 9-11, the other face work ~20, the per-tower
+  tests ~15, the ordering 1-3.
+- **The same film can differ a lot from run to run when watchdogs are about:** the street jump
+  missed 3 frames on one run and 11 on the next. Film twice before believing a change.
+- **Slow motion (Z) doesn't slow the game on foot:** shots in it land at normal speed.
+- **The walker's frame roofs** (`walker.c`, `WALKER_FRAME_REACH`): each frame copies out the
+  roofs within a flight's reach and tests only those. That cut wk from 16-19% to 6-8% running.
+  `walker_frame_narrowing = 0` turns it off, so the unit test can walk the same walk both ways
+  and compare.
+- **The seen rows are in the boxes' order, not the plan's** (2026-11-18): `city_seen_bit(tower)`, block by
+  block, a block's four towers a nibble. Read a row with `city_seen_has(row, tower)`, never `row[t >> 3]`.
+  level.c checks `grey_city_order` against it when the boxes are listed (a `jo_core_error` if they differ).
+- **MSVC's C has no `_Static_assert`**: code the PC tests build (src/game) uses `typedef char
+  name[cond ? 1 : -1];`. level.c (Saturn only) can use `_Static_assert`.
+- **SG-9's depth limit** (`jo_3d_set_depth_limit`): set before the first polygon of the frame (the slave
+  starts drawing as soon as a mesh is handed over), in jo's units (world >> 2), and back to -1 before the
+  mirror and the HUD: jo tests sprites against it too. A covering wall must be deeper than the near plane
+  at every corner, or it isn't drawn and only VDP2 shows. The hole check can't see that: read the shots.
+- **The pause menu's Wireframe** (last line, after Jump to): `jo_3d_set_wireframe` live, no build of its own.
+- **jo's Logos/ folder** has the author's logos (logo-mark.png 240x160, ~2900 colours; 16 is close). jo
+  has no splash screen; none's been asked for upstream (searched 2026-11-18).
+- **Upstream's optional low Work RAM code** (`JO_COMPILE_WITH_LOW_WORK_RAM_CODE`, 2026-11): off here.
+  If it's ever on, our `jo_add_memory_zone(0x00200000, ...)` would write over it: start from
+  `JO_LOW_WORK_RAM_FREE`. Check `___jo_low_work_ram_end` in game.map (0x00200000: empty).
+- **Landmarks and the city's ring** (2026-11-18): VDP1 draws far to near by each polygon's depth, so a
+  landmark nearer than the ring is drawn over the skyline whatever its sort. Push it out (`landmark_behind_ring`)
+  and it's behind; but the city is near world x +20 000, so pushing past the ring can run into jo's
+  16.16 limit (+-32 767): then it's hidden below the ring's top instead.
+- **Up the lift, CPU goes on faces, not pixels**: ~250 tower tops took the boxes from 27-49% to 71-94% of
+  a frame. Join equal heights, and draw tops only near (`GREY_TOPS_REACH`), lids beyond.
+- **Probing a value on screen**: `jo_printf(0, 11, ...)` lines under the readout, marked `// PROBE`, show
+  40 columns only; a short film of 12 shots (probe_*.steps) reads them. Take both out after.
+- **The mirror's cost is drawing the corridor twice, not cutting it to the glass** (SG-10, 2026-11-18):
+  jo's far window clipped by VDP1 gave the same `mi` (35-50%) as the CPU's cut. Dropping a CPU cull plane
+  lets more polygons through to be transformed. Before moving a cut to VDP1, check the cut is the cost.
+- **jo's cells have no fog** (SG-11): static models with baked light. Our per-frame distance fog would
+  have to rewrite their Gouraud tables each frame. Cells fit rooms built in jo's tools, not our city.
+- **Signed shifts and variable shifts, the quick way** (`src/utils/fastmath.h`, 2026-11-19): `ASR(x, n)` for
+  any signed `x >> n` (n not 1, 2 or 16) on a per-element path; `(unsigned)` it instead where the value
+  can't be negative; `BIT_SET(byte, bit)` for a bit picked by a variable; `fast_udiv` (division unit, both
+  operands 0 .. 2^31 - 1) for a division that must stay per element. Check with `slow_calls.py` after.
+  The rewrite is only safe where the bracketed group is the shift's whole left operand: `a + (b) >> 8`
+  shifts the sum. Python on Windows: raw strings for paths and backslashes (a `\u` broke two scripts),
+  and pass long text through a file; a makefile line break written as a two-character backslash-n went in
+  literally and the build looked for a file called `\n`.
+- **Profiling both CPUs, function by function** (jo's PC sampler, 2026-11-19): set the film's boot settings
+  in features.h by hand (so run_e2e films that build, not one of its own), `JO_COMPILE_WITH_PROFILER_MODULE
+  = 1` (without it `jo_profile_sampling_start` is an empty macro), `$env:PCPROF_FRAME='2'` (the makefile
+  passes it as JO_TEST_PCPROF_FRAME), build, copy game.elf aside, film a `.steps` ending in `savestate NAME`,
+  then `python tests/e2e/pcprof.py NAME.mc0 game.elf`. main.c keeps the heap out of the histograms (the top
+  128 KB of Low Work RAM). Mednafen's states land in /tmp/mednafen/mcs in the container; F5 must go to the
+  focused window (`xdotool key F5`, not `--window`). Put everything back after, and unset PCPROF_FRAME.
+- **`sidle` near 0 doesn't mean the slave is busy**: the sampler showed it 62-87% idle in jo's job wait while
+  the master ran at 100-120%. Measure before moving work between the CPUs.
+- **A jo_malloc block that doesn't fit High Work RAM goes to Low Work RAM, silently** (2026-11-19): main.c
+  gives jo Low Work RAM as a second zone. `corridor_memory` grew to 108 888 bytes and landed at 0x0020_0008:
+  every view slowed (Low Work RAM reads at about half speed). After growing a big allocation, print its
+  address once on the readout (0x060..... is High Work RAM). Split a big block in two rather than grow it.
+- **Work shared between the CPUs: wait only when there's something to wait for.** A `slave_draw_wait()`
+  every frame (before the sky changes `level_view`) stopped the master in the corridor, where the slave's
+  glass and boxes used to overlap the sky: the bench's corridor views went from 0-16 late to 49-68. Wait
+  only in frames the slave was given the shared work (`level_city_shared`).
+- **What a slave job may touch** (level.c, grey_groups_draw): only state set before the job is queued and
+  not changed until it's waited for, and only its own output. Every function it calls that writes takes
+  the mesh to write to (no global `grey_out` on the slave). A flag the master sets (the stairs' profile)
+  is read only after an index test that a city box never passes.
+- **Get somewhere fast to test it** (2026-11-17): the pause menu's last line, "Jump to" (START,
+  L six times, R for each place; `game/jumps.h`). It works from the opening and the race too (it
+  boots on foot first), so a film can `wait_boot`, then jump, with no `boot_at` rebuild.
+  `jumps.steps` shows the presses.
+- **Is it this feature's frames?** Run `bench.steps` twice, once with the feature's own switch off
+  (e.g. `CITY_WATCHDOGS 0` in city.h), and compare the late counts. The watchdogs: 155 late without,
+  334 with, and a part far from any drone (`ds` at the SCSP, 26%) means something isn't culled.
+- **The hole check can't see VDP1 running out of time** (2026-11-17): an unfinished frame shows the
+  VDP2 board where the nearest polygons should be, not the magenta back colour, so `holes_to`
+  passes. Read `vdp1 over N/T` on the shots, and `px` in a profiler build (row 9; crop rows ~140-270
+  of a 704-wide shot to read it). Mid-jump over a street was 606k px against 326k stood on a roof:
+  with no roof under you the seen table and the floor hiding are both off.
+- **`boot_at` and "Jump to" set the checkpoint** there: a film caught by a watchdog starts again
+  where it booted, not back in the corridor (it did, and a city film filmed the corridor).
+- **Walls are square to the walker** (`walker.c` `depth_in`): a wall's end stops you while your
+  middle is within `WALKER_RADIUS` of it either way, corners too, not by a circle. A test at exactly
+  the radius from a wall's end is still blocked.
 
 ## Editing files here
 
@@ -585,6 +803,36 @@ CLAUDE.md sit in the jo-engine checkout around it.
   wedges and spikes. Cut what's drawn to a box round what's on screen. Trail walls with no
   thickness are edge-on (hairlines) when the camera looks along them: text written with
   trails needs the camera turned off the grid's axes (30 degrees worked).
+- **A full mesh drops what's added last, so the order you add in is what's missing** (2026-11-16).
+  level.c's `level_face_add` leaves a face out when the mesh is full. The grey mesh ran out of
+  *points* (`GREY_POINTS_MAX` 1000, 4 a quad: ~250 faces) long before its quads (448), so the
+  readout's `poly 255` / `vert ~1016` is the sign. Up the CD block's lift no roof hides anything,
+  and the city went in block by block in plan order, so the hub's own rows, right under you, were
+  the ones dropped. Add nearest first (`game/near_first.h`), and the dropped ones are far off in
+  the fog. Look for a count stuck at a round number before hunting a culling bug.
+- **Measure the most a level-of-detail could save before building it** (2026-11-16): a test build
+  that just leaves out everything past a distance is the upper bound. For the city in the streets
+  it was 10-20% of a frame: most of `sd` there is per-tower work near you. What fog hides wholly
+  (full fog, under the eye: near black on the black floor) can go for nothing: on the lift that
+  took the east view from 24 to 41 fps.
+- **Timing the city's tower work part by part** (2026-11-16): with no watchdog, its readout
+  slots `dr dm ds` are free. Wrap the suspects in `perf_part_add(PERF_DRONE...)` for one film,
+  and widen the readout crop to ~195 rows to see row 7. At 0880 no one step dominated: ~7000
+  cycles per tower drawn, spread over trims, cuts and checks. Leaving out whole blocks early
+  (none of their towers seen) paid more than speeding up one step would have.
+  Now the watchdogs fly again (2026-11-17), `dr dm ds` are theirs: borrow other slots instead.
+- **A walk over the city's 256 boxes is ~1% a frame per walk** (2026-11-17): three drones each
+  looking for the roof under their beam every frame was `dr` 4-6%; once in 8 frames, each on its
+  own frame, 2-3%. Anything per drone per frame that walks the boxes needs the same, or the grid.
+- **MSVC (the PC tests) has no `_Static_assert` in C**: city.c, compiled for both, uses the array
+  trick (`typedef char x[cond ? 1 : -1]`). level.c, Saturn only, can use `_Static_assert`.
+- **Steering without an arctangent** (game/drone.c `fly`): with f the unit facing (x1024) and t
+  the way to go, f.t is |t|cos and (fy, -fx).t is |t|sin of the error; their ratio is tan, and
+  the second's sign is which way to turn. One division per object per frame, for a proportional
+  turn near the aim.
+- **A convex shape's "which sides face me" is its inside test**: the planes you're outside of are
+  the sides that face you (game/drone.c `drone_beam_outside`, used for both seeing you and
+  drawing the beam's sides). Compare signs, don't multiply them; shift the normal down first.
 
 ### Frame timing: what "late" and "60 fps" hide (found 2026-11-15)
 

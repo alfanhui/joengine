@@ -87,8 +87,8 @@ endif
 # chosen by the game in its makefile (JO_MINIMAL = 1 and JO_COMPILE_WITH_FS_MODULE = 1: the files of the CD too). The
 # file system is on with the modules that read files (TGA, AUDIO, VIDEO), unless the game sets it.
 # JO_DEBUG keeps its default (1): JO_DEBUG = 0 removes the checks and the error messages too (a release).
-# Sizes of Samples/demo - minimal (game.raw: rectangles, a sprite made in the program, the pad): 29052 bytes with the
-# default engine, 20940 with JO_MINIMAL = 1, 17616 with JO_MINIMAL = 1 and JO_DEBUG = 0 (see also jo/conf.h)
+# Sizes of Samples/demo - minimal (game.raw: rectangles, a sprite made in the program, the pad): 30292 bytes with the
+# default engine, 19652 with JO_MINIMAL = 1, 15432 with JO_MINIMAL = 1 and JO_DEBUG = 0 (see also jo/conf.h)
 ifeq (1,${JO_MINIMAL})
 ifeq (${JO_COMPILE_WITH_FS_MODULE},)
 ifneq ($(filter 1,${JO_COMPILE_WITH_TGA_MODULE} ${JO_COMPILE_WITH_AUDIO_MODULE} ${JO_COMPILE_WITH_VIDEO_MODULE}),)
@@ -174,7 +174,7 @@ endif
 
 ifeq (1,${JO_COMPILE_WITH_3D_MODULE})
 	CCFLAGS += -DJO_COMPILE_WITH_3D_SUPPORT
-	SRCS += $(JO_ENGINE_SRC_DIR)/3d.c $(JO_ENGINE_SRC_DIR)/model.c $(JO_ENGINE_SRC_DIR)/light.c $(JO_ENGINE_SRC_DIR)/glow.c
+	SRCS += $(JO_ENGINE_SRC_DIR)/3d.c $(JO_ENGINE_SRC_DIR)/model.c $(JO_ENGINE_SRC_DIR)/light.c $(JO_ENGINE_SRC_DIR)/glow.c $(JO_ENGINE_SRC_DIR)/water.c $(JO_ENGINE_SRC_DIR)/water_objects.c $(JO_ENGINE_SRC_DIR)/sun.c $(JO_ENGINE_SRC_DIR)/transparency.c
 endif
 
 # Levels (.JOL files, see Documentation/level_format.md)
@@ -300,6 +300,14 @@ else
 	endif
 endif
 
+# (JO_COMPILE_WITH_LOW_WORK_RAM_CODE = 1: the functions marked JO_LOW_WORK_RAM_CODE (loading, creation, menus: read rarely)
+# run in the low work RAM, the high work RAM they leave goes to jo_malloc(); the low work RAM free starts at
+# JO_LOW_WORK_RAM_FREE (jo_add_memory_zone() skips them by itself, see jo.linker). Off by default: a program that writes in
+# the low work RAM from 0x00200000 by itself would write over them)
+ifeq (1,${JO_COMPILE_WITH_LOW_WORK_RAM_CODE})
+	CCFLAGS += -DJO_COMPILE_WITH_LOW_WORK_RAM_CODE
+endif
+
 ifeq (${JO_COMPILE_WITH_DUAL_CPU_MODULE},)
 	CCFLAGS += -DJO_COMPILE_WITH_DUAL_CPU_SUPPORT
 	SRCS += $(JO_ENGINE_SRC_DIR)/slave.c
@@ -317,6 +325,11 @@ SRCS += $(JO_ENGINE_SRC_DIR)/font.c $(JO_ENGINE_SRC_DIR)/input.c $(JO_ENGINE_SRC
 		$(JO_ENGINE_SRC_DIR)/vdp2_malloc.c $(JO_ENGINE_SRC_DIR)/smpc.c $(JO_ENGINE_SRC_DIR)/dsp.c
 
 SYSOBJS = $(JO_ENGINE_SRC_DIR)/start.o
+# The warnings of the link (jo_engine/link_warnings.S): each call of the float emulation of libgcc (float and double: the
+# SH-2 has no FPU) is reported with the function that makes it. JO_LINK_WARNINGS = 0 in the makefile of a game: none
+ifneq (${JO_LINK_WARNINGS},0)
+SYSOBJS += $(JO_ENGINE_SRC_DIR)/link_warnings.o
+endif
 
 OBJS = $(SRCS:.c=.o)
 
@@ -380,6 +393,10 @@ endif
 endif
 
 LDFLAGS = -m2
+# Link: the same -O2 -flto as the compilation (as GCC recommends), and each function and variable in its own section
+# with --gc-sections: the code that the LTO makes useless (a function inlined everywhere, the table of a removed
+# function) is not linked (jo.linker keeps the start code with KEEP())
+LDFLAGS += -O2 -flto -ffunction-sections -fdata-sections -Wl,--gc-sections
 LDFLAGS +=-Xlinker -T$(LDFILE) -Xlinker -Map \
           -Xlinker $(MPFILE) -Xlinker -e -Xlinker ___Start -nostartfiles
 ifneq ($(OS), Windows_NT)
@@ -417,11 +434,19 @@ MAKEFILE = makefile
 
 # The objects of the engine are shared by the games (jo_engine/*.o): they are rebuilt when the options change (another
 # game, a module added to the makefile, other test flags). The options of the last build: jo_engine/jo_options.txt
-# (GNU Make 4.2 or more: $(file))
+# GNU Make 4.2 or more: $(file). Older versions (the GNU Make 3.81 of macOS) don't have $(file) to read it (nothing
+# was written and the build stopped on "No rule to make target jo_options.txt"): the shell writes it
 JO_OPTIONS_FILE = $(JO_ENGINE_SRC_DIR)/jo_options.txt
 JO_OPTIONS = $(strip $(CCFLAGS) $(_CCFLAGS) $(DFLAGS))
+ifneq ($(filter 3.% 4.0 4.0.% 4.1 4.1.%,$(MAKE_VERSION)),)
+JO_OPTIONS_LAST := $(shell cat "$(JO_OPTIONS_FILE)" 2>/dev/null)
+ifneq ($(strip $(JO_OPTIONS_LAST)),$(JO_OPTIONS))
+JO_OPTIONS_WRITE := $(shell printf '%s\n' '$(subst ','\'',$(JO_OPTIONS))' > "$(JO_OPTIONS_FILE)")
+endif
+else
 ifneq ($(strip $(file < $(JO_OPTIONS_FILE))),$(JO_OPTIONS))
 $(file > $(JO_OPTIONS_FILE),$(JO_OPTIONS))
+endif
 endif
 
 .PHONY : all clean re
@@ -439,6 +464,8 @@ endif
 endif
 
 $(OBJS) $(SYSOBJS): $(JO_OPTIONS_FILE)
+# (the file could not be written, a read-only folder: the objects are built again instead of stopping the build)
+$(JO_OPTIONS_FILE):
 
 $(TARGET) : $(SYSOBJS) $(OBJS) $(MAKEFILE) $(LDFILE)
 	$(CC) $(LDFLAGS) $(SYSOBJS) $(OBJS) $(LIBS) -o $@
@@ -479,6 +506,9 @@ endif
 	$(CC) $< $(DFLAGS) $(CCFLAGS) $(_CCFLAGS) -o $@
 
 $(JO_ENGINE_SRC_DIR)/start.o: $(JO_ENGINE_SRC_DIR)/start.S
+	$(CC) -m2 -c $< -o $@
+
+$(JO_ENGINE_SRC_DIR)/link_warnings.o: $(JO_ENGINE_SRC_DIR)/link_warnings.S
 	$(CC) -m2 -c $< -o $@
 
 clean:

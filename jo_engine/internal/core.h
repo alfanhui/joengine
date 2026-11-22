@@ -39,7 +39,54 @@
 
 #ifdef JO_DEBUG
 
-void    __jo_core_error(char *message, const char *function);
+/** @brief The error screen (or the handler of jo_core_set_error_handler()) (Internal usage): out of the hot code, one copy */
+void    __jo_core_error(char *message, const char *function) __attribute__((cold, noinline));
+
+#ifdef JO_COMPILE_WITH_PRINTF_SUPPORT
+/** @brief The error screen of the CPU exceptions (Internal usage): JO_DEBUG and the printf module (it shows the registers) */
+# define JO_CORE_EXCEPTION_SCREEN
+#endif
+
+#ifdef JO_CORE_EXCEPTION_SCREEN
+
+/** @brief The registers of a CPU at a CPU exception (Internal usage), written by its handler (see core.c) through the
+ *  cache-through address: read the same way (the slave CPU writes them, the master CPU shows them)
+ *  @remarks Its size and the order of its fields are used by the handlers (assembly)
+ */
+typedef struct
+{
+    /** @brief Vector of the exception (4, 6, 9 or 10), 0: none. Written last */
+    unsigned int    vector;
+    /** @brief R0 to R15 (R15: the stack pointer before the exception) */
+    unsigned int    r[16];
+    /** @brief PC and SR saved by the exception */
+    unsigned int    pc;
+    unsigned int    sr;
+    unsigned int    pr;
+    unsigned int    gbr;
+    unsigned int    vbr;
+    unsigned int    mach;
+    unsigned int    macl;
+}                   __jo_core_exception_registers;
+
+/** @brief The registers of the slave CPU at its CPU exception (Internal usage, see __jo_core_exception_registers) */
+extern __jo_core_exception_registers    __jo_core_slave_exception;
+
+/** @brief Show the error screen of a CPU exception (Internal usage): the interrupts masked, on the top of the stack of
+ *  the master CPU, the program stops there
+ *  @param registers The registers (cache-through address)
+ *  @warning Master CPU only
+ */
+void    __jo_core_show_exception(const volatile __jo_core_exception_registers *registers) __attribute__((noreturn));
+
+#ifdef JO_COMPILE_WITH_DUAL_CPU_SUPPORT
+/** @brief The handlers of the CPU exceptions of the slave CPU, in its vector table (Internal usage)
+ *  @warning Slave CPU only, after its vector base register is set
+ */
+void    __jo_core_init_slave_exceptions(void);
+#endif
+
+#endif /* !JO_CORE_EXCEPTION_SCREEN */
 
 #endif /* !JO_DEBUG */
 
@@ -109,6 +156,18 @@ static  __jo_force_inline unsigned int  __jo_core_get_sr(void)
 
     __asm__ volatile ("stc sr, %0" : "=r" (sr));
     return (sr);
+}
+
+/** @brief Check if the code runs on the slave CPU (Internal usage)
+ *  @remarks The stack of the slave CPU is at the start of the high work RAM, below JO_WORK_RAM_SLAVE_STACK_TOP
+ */
+static  __jo_force_inline bool      __jo_core_on_slave_cpu(void)
+{
+    unsigned int                    sp;
+
+    __asm__ volatile ("mov r15, %0" : "=r" (sp));
+    sp &= ~JO_CACHE_THROUGH(0);
+    return (sp >= JO_WORK_RAM_HIGH && sp <= JO_WORK_RAM_SLAVE_STACK_TOP);
 }
 
 /** @brief Set CPU status register (Internal usage)

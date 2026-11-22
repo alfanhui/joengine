@@ -86,6 +86,36 @@
 /** @brief Vertice structure */
 typedef jo_pos3D    jo_vertice;
 
+/** @brief Vertex count of a quad (jo_3d_create_mesh_from_vertices() takes 4 vertices for each quad) */
+# define JO_3D_QUAD_VERTEX_COUNT    (4)
+
+/** @brief Fill the 4 vertices of a quad (a parallelogram) from its center and 2 half edges, in the order of
+ *  JO_3D_PLANE_VERTICES(): center - right - down, center + right - down, center + right + down, center - right + down
+ *  @param vertices The 4 vertices to fill (for instance a part of the table given to jo_3d_create_mesh_from_vertices())
+ *  @param center Center of the quad
+ *  @param right Half of the edge from the first vertex to the second one (the top edge of the texture, left to right)
+ *  @param down Half of the edge from the first vertex to the fourth one (the left edge of the texture, top to bottom)
+ *  @remarks The front face is the side opposite to the cross product right x down: seen from there, the vertices turn
+ *  clockwise (Y down). For instance right = (S, 0, 0) and down = (0, S, 0) give JO_3D_PLANE_VERTICES(S), facing -Z;
+ *  right = (S, 0, 0) and down = (0, 0, -S) give a floor tile facing up (-Y) with the top of its texture toward +Z
+ */
+static  __jo_force_inline void      jo_3d_set_quad_vertices(jo_vertice * const vertices, const jo_vertice * const center,
+                                                            const jo_vertice * const right, const jo_vertice * const down)
+{
+    vertices[0].x = center->x - right->x - down->x;
+    vertices[0].y = center->y - right->y - down->y;
+    vertices[0].z = center->z - right->z - down->z;
+    vertices[1].x = center->x + right->x - down->x;
+    vertices[1].y = center->y + right->y - down->y;
+    vertices[1].z = center->z + right->z - down->z;
+    vertices[2].x = center->x + right->x + down->x;
+    vertices[2].y = center->y + right->y + down->y;
+    vertices[2].z = center->z + right->z + down->z;
+    vertices[3].x = center->x - right->x + down->x;
+    vertices[3].y = center->y - right->y + down->y;
+    vertices[3].z = center->z - right->z + down->z;
+}
+
 /** @brief Default perspective angle in degree (see jo_3d_perspective_angle()) */
 # define JO_3D_DEFAULT_PERSPECTIVE_ANGLE    (90)
 
@@ -496,6 +526,9 @@ void                                jo_3d_create_plane(jo_3d_quad * const quad, 
 /** @brief Create a cube
  *  @param array Address to a 6 jo_3d_quad allocated struct
  *  @param vertices Vertices coords (table of 24 (6x4) jo_vertice)
+ *  @remarks Its 6 quads are drawn by 6 calls (see jo_3d_draw_array()). The same cube as a mesh is drawn about 1.7 times
+ *  faster: jo_3d_create_mesh_from_vertices(6, table) with a table of JO_3D_CUBE_VERTICES() (not the table given to this
+ *  function: it converts it), then jo_3d_mesh_draw()
  */
 void                                jo_3d_create_cube(jo_3d_quad * array, jo_vertice * const vertices);
 
@@ -511,6 +544,10 @@ void                                jo_3d_create_triangle(jo_3d_quad * const qua
  */
 static  __jo_force_inline jo_3d_quad    *jo_3d_get_sprite_quad(const int sprite_id)
 {
+#ifdef JO_DEBUG
+    if (sprite_id < 0 || __JO_SPRITE_IS_MISSING(sprite_id))
+        return (JO_NULL);
+#endif
     return ((__jo_sprite_quad == JO_NULL || __jo_sprite_quad[sprite_id] == JO_NULL) && !jo_3d_create_sprite_quad(sprite_id) ? JO_NULL : __jo_sprite_quad[sprite_id]);
 }
 
@@ -548,6 +585,16 @@ void                                jo_3d_set_mesh_polygon_texture(jo_3d_mesh * 
 void                                jo_3d_set_mesh_polygon_texture_bank(jo_3d_mesh * const mesh, const int sprite_id, const jo_palette * const palette,
                                                                         const int bank, const unsigned int index);
 
+/** @brief Set a texture of 256 colors on one polygon, its colors taken in a palette (its pixel value n: the color n of the
+ *  palette): opaque over a see-through bottom where the MSB of the colors is cleared, see jo_vdp2_blend_rgb_sprites_only()
+ *  @param mesh Address to a jo_3d_mesh allocated struct
+ *  @param sprite_id Sprite ID (256 colors: jo_sprite_add_8bits_image(), jo_level_add_textures8())
+ *  @param palette Palette (jo_create_palette(), see jo_level_set_textures8_palette())
+ *  @param index polygon index on the mesh
+ */
+void                                jo_3d_set_mesh_polygon_texture_palette(jo_3d_mesh * const mesh, const int sprite_id, const jo_palette * const palette,
+                                                                           const unsigned int index);
+
 /** @brief Set a texture on the mesh
  *  @param mesh Address to a jo_3d_mesh allocated struct
  *  @param sprite_id Sprite ID
@@ -581,6 +628,11 @@ void                        jo_3d_set_mesh_polygon_wireframe(jo_3d_mesh * const 
  */
 static  __jo_force_inline void      jo_3d_set_mesh_polygon_palette(jo_3d_mesh * const mesh, const int palette_id, const unsigned int index)
 {
+#ifdef JO_DEBUG
+    if (__JO_INDEX_IS_WRONG(palette_id, JO_PALETTE_MAX, "palette id") ||
+        __JO_INDEX_IS_WRONG(index, mesh->data.polygon_count, "polygon index"))
+        return;
+#endif
     mesh->data.attributes[index].color = JO_MULT_BY_256(palette_id);
 }
 
@@ -590,6 +642,11 @@ static  __jo_force_inline void      jo_3d_set_mesh_polygon_palette(jo_3d_mesh * 
  */
 static  __jo_force_inline void      jo_3d_set_mesh_palette(jo_3d_mesh * const mesh, const int palette_id)
 {
+    // (once: not an error for each polygon)
+#ifdef JO_DEBUG
+    if (__JO_INDEX_IS_WRONG(palette_id, JO_PALETTE_MAX, "palette id"))
+        return;
+#endif
     for (unsigned int i = 0; i < mesh->data.polygon_count; ++i)
         jo_3d_set_mesh_polygon_palette(mesh, palette_id, i);
 }
@@ -600,6 +657,10 @@ static  __jo_force_inline void      jo_3d_set_mesh_palette(jo_3d_mesh * const me
  */
 static  __jo_force_inline void      jo_3d_set_palette(jo_3d_quad * const quad, const int palette_id)
 {
+#ifdef JO_DEBUG
+    if (__JO_INDEX_IS_WRONG(palette_id, JO_PALETTE_MAX, "palette id"))
+        return;
+#endif
     quad->attribute.color = JO_MULT_BY_256(palette_id);
 }
 
@@ -610,6 +671,10 @@ static  __jo_force_inline void      jo_3d_set_palette(jo_3d_quad * const quad, c
  */
 static  __jo_force_inline bool      jo_3d_set_sprite_palette(const int sprite_id, const int palette_id)
 {
+#ifdef JO_DEBUG
+    if (sprite_id < 0 || __JO_SPRITE_IS_MISSING(sprite_id) || __JO_INDEX_IS_WRONG(palette_id, JO_PALETTE_MAX, "palette id"))
+        return (false);
+#endif
     if ((__jo_sprite_quad == JO_NULL || __jo_sprite_quad[sprite_id] == JO_NULL) && !jo_3d_create_sprite_quad(sprite_id)) return (false);
     jo_3d_set_palette(__jo_sprite_quad[sprite_id], palette_id);
     return (true);
@@ -627,6 +692,18 @@ void                                jo_3d_set_mesh_polygon_high_speed_shrink(jo_
  *  @param enabled true to enable High Speed Shrink
  */
 void                                jo_3d_set_mesh_high_speed_shrink(jo_3d_mesh * const mesh, const bool enabled);
+
+/** @brief High speed shrink for every textured polygon drawn from now on (models, meshes, levels), whatever their own
+ *  setting (default: on); can be changed at any time (a scene, a view)
+ *  @param enabled true: all of them, false: back to their own setting (jo_3d_set_mesh_high_speed_shrink(), the materials
+ *  JO_3D_MATERIAL_HIGH_SPEED_SHRINK): a texture whose details of one texel must stay sharp far away (a small text)
+ *  @remarks A texture drawn smaller than it is on a line (far away, seen at an angle): the VDP1 reads every other texel
+ *  (the even ones) instead of all of them, the line takes about half the time on a console (any shrink, even a small
+ *  one). No change for the textures drawn at their size or bigger. The cost: a little less sharp far away, a detail of one
+ *  texel (a thin line, a small text) can flicker or vanish between two copies of the mipmaps (jo_3d_set_texture_mipmaps())
+ *  @remarks Mednafen draws the picture of the high speed shrink but not its gain: measure on a console
+ */
+void                                jo_3d_set_high_speed_shrink(const bool enabled);
 
 /*
 ███╗   ███╗███████╗███████╗██╗  ██╗    ██╗   ██╗███████╗██████╗ ████████╗██╗ ██████╗███████╗       ██╗       ███╗   ██╗ ██████╗ ██████╗ ███╗   ███╗ █████╗ ██╗
@@ -646,6 +723,10 @@ void                                jo_3d_set_mesh_high_speed_shrink(jo_3d_mesh 
  */
 static  __jo_force_inline void      jo_3d_set_mesh_vertice(jo_3d_mesh * const mesh, const jo_fixed x, const jo_fixed y, const jo_fixed z, const unsigned int index)
 {
+#ifdef JO_DEBUG
+    if (__JO_INDEX_IS_WRONG(index, mesh->data.point_count, "point index"))
+        return;
+#endif
     mesh->data.points[index].x = x;
     mesh->data.points[index].y = y;
     mesh->data.points[index].z = z;
@@ -660,6 +741,10 @@ static  __jo_force_inline void      jo_3d_set_mesh_vertice(jo_3d_mesh * const me
  */
 static  __jo_force_inline void      jo_3d_set_mesh_normal(jo_3d_mesh * const mesh, const jo_fixed x, const jo_fixed y, const jo_fixed z, const unsigned int index)
 {
+#ifdef JO_DEBUG
+    if (__JO_INDEX_IS_WRONG(index, mesh->data.polygon_count, "polygon index"))
+        return;
+#endif
     mesh->data.polygons[index].normal.x = x;
     mesh->data.polygons[index].normal.y = y;
     mesh->data.polygons[index].normal.z = z;
@@ -796,6 +881,27 @@ static  __jo_force_inline void      jo_3d_set_screen_doors(jo_3d_quad *const qua
 {
     jo_3d_set_mesh_polygon_screen_doors((jo_3d_mesh *)quad, enabled, 0);
 }
+
+/******************************************************
+*                  GOURAUD SHADING
+*******************************************************/
+
+/** @brief Give a gouraud table to one polygon of the mesh (the color of each of its 4 vertices is added to its color)
+ *  @param mesh Address to a jo_3d_mesh allocated struct
+ *  @param table Address / 8 of the table (see jo_3d_add_gouraud_tables()), JO_VDP1_NO_GOURAUD: no gouraud shading
+ *  @param index polygon index on the mesh
+ *  @remarks The light of the mesh (jo_3d_set_mesh_light()) writes its own tables: don't use both on a polygon
+ */
+void                                jo_3d_set_mesh_polygon_gouraud(jo_3d_mesh * const mesh, const unsigned short table, const unsigned int index);
+
+/** @brief Gouraud shading of the whole mesh: one table of 4 colors per polygon (a color per vertex, in the order of the
+ *  vertices of the polygon), added to the VRAM (see jo_3d_add_gouraud_tables())
+ *  @param mesh Address to a jo_3d_mesh allocated struct
+ *  @param tables Colors: 4 per polygon (JO_COLOR_SATURN_RGB(16, 16, 16): the color of the polygon unchanged; the
+ *  gouraud shading doesn't saturate: a component over 31 wraps around to the dark)
+ *  @return Address / 8 of the first table (the table of the polygon i: + i, to change its colors later), 0 if out of memory
+ */
+unsigned short                      jo_3d_set_mesh_gouraud(jo_3d_mesh * const mesh, const jo_color * const tables);
 
 /*
  ██████╗ ██████╗ ██╗      ██████╗ ██████╗ ███████╗
@@ -1059,9 +1165,18 @@ static  __jo_force_inline void      jo_3d_translate_matrix_z(int z)
 
 /** @brief Draw a quadrilateral
  *  @param quad Address to a jo_3d_quad allocated struct
+ *  @remarks Each call transforms its vertices and prepares its drawing: the quads of an object are drawn faster as one
+ *  mesh (jo_3d_mesh_draw())
  */
 static  __jo_force_inline void      jo_3d_draw(jo_3d_quad *const quad)
 {
+#ifdef JO_DEBUG
+    if (quad == JO_NULL)
+    {
+        jo_core_error("quad is null");
+        return;
+    }
+#endif
     __jo_3d_draw(&quad->data);
 }
 
@@ -1070,6 +1185,13 @@ static  __jo_force_inline void      jo_3d_draw(jo_3d_quad *const quad)
  */
 static  __jo_force_inline void      jo_3d_mesh_draw(jo_3d_mesh *const mesh)
 {
+#ifdef JO_DEBUG
+    if (mesh == JO_NULL)
+    {
+        jo_core_error("mesh is null");
+        return;
+    }
+#endif
     __jo_3d_draw(&mesh->data);
 }
 
@@ -1137,6 +1259,8 @@ static  __jo_force_inline void      jo_3d_draw_list(jo_list *const list)
 /** @brief Draw an array of quadrilateral
  *  @param array Array of quadrilateral
  *  @param array_size Size of the array
+ *  @remarks One jo_3d_draw() per quad: the same quads in one mesh (jo_3d_create_mesh_from_vertices(),
+ *  jo_3d_mesh_draw()) are drawn about 1.7 times faster (a cube of 6 quads: 11 500 cycles, as a mesh 7 100)
  */
 static  __jo_force_inline void      jo_3d_draw_array(jo_3d_quad * const array, int array_size)
 {
@@ -1146,6 +1270,8 @@ static  __jo_force_inline void      jo_3d_draw_array(jo_3d_quad * const array, i
 /** @brief Draw a sprite
  *  @param sprite_id Sprite Id returned by jo_sprite_add(), jo_sprite_add_tga() or jo_sprite_add_image_pack()
  *  @return true if succeeded otherwise false
+ *  @remarks A quad of the 3D (it turns with the current matrix): a sprite that faces the camera (particles, items,
+ *  trees) costs about a third with jo_3d_draw_billboard() or jo_3d_draw_standing_sprite() (no polygon pipeline)
  */
 static  __jo_force_inline bool      jo_3d_draw_sprite(const int sprite_id)
 {
@@ -1303,8 +1429,11 @@ static  __jo_force_inline void      jo_3d_window_clip(const bool clip)
 /** @brief Second far window for jo_3d_select_window() (a second mirror) */
 # define JO_3D_FAR_WINDOW_2                 (2)
 
+/** @brief Window of the transparency layer (see jo/transparency.h): selected by jo_3d_transparency_begin() */
+# define JO_3D_LAYER_WINDOW                 (JO_VDP1_OFF_SCREEN_WINDOW)
+
 /** @brief Select the window used by jo_3d_window() and by the next drawings
- *  @param window JO_3D_NEAR_WINDOW, JO_3D_FAR_WINDOW or JO_3D_FAR_WINDOW_2
+ *  @param window JO_3D_NEAR_WINDOW, JO_3D_FAR_WINDOW, JO_3D_FAR_WINDOW_2 or JO_3D_LAYER_WINDOW
  */
 static  __jo_force_inline void      jo_3d_select_window(const int window)
 {
@@ -1451,7 +1580,7 @@ void                                jo_3d_transform_point_by(const jo_fixed (* c
 
 /** @brief Select the window of the next drawings of the slave CPU (call it on the slave CPU; jo_3d_slave_begin() selects
  *  the window of the master CPU, see jo_3d_select_window())
- *  @param window JO_3D_NEAR_WINDOW, JO_3D_FAR_WINDOW or JO_3D_FAR_WINDOW_2
+ *  @param window JO_3D_NEAR_WINDOW, JO_3D_FAR_WINDOW, JO_3D_FAR_WINDOW_2 or JO_3D_LAYER_WINDOW
  */
 void                                jo_3d_slave_select_window(const int window);
 
@@ -1696,7 +1825,7 @@ void                                jo_3d_set_texture_subdivision_error(const in
  *  (the VDP1 draws their pixels out of the screen too)
  *  @param enabled true: fewer parts (the CPU time of the parts saved), false: the default
  *  @remarks For both CPUs. A split screen (2 views per frame, each one half as high: the texture slides less, the VDP1 has
- *  time to spare): about 10 % of the time of the CPUs (Mednafen emulated the split screen of the rally demo 10 % faster)
+ *  time to spare): about 10 % of the time of the CPUs (Mednafen emulated a split screen of a 3D game 10 % faster)
  */
 void                                jo_3d_set_fewer_parts(const bool enabled);
 
@@ -1819,6 +1948,13 @@ bool                                __jo_3d_slave_draw_ranges_from(const jo_3d_m
  */
 static  __jo_force_inline bool      jo_3d_slave_mesh_draw(const jo_3d_mesh * const mesh)
 {
+#ifdef JO_DEBUG
+    if (mesh == JO_NULL)
+    {
+        jo_core_error("mesh is null");
+        return (false);
+    }
+#endif
     return (jo_3d_slave_mesh_draw_ranges(mesh, mesh->data.point_count, JO_NULL, 0));
 }
 
